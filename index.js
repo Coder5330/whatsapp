@@ -18,6 +18,7 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
   { id: 'Marshall', name: 'Marshall' },
+  { id: 'Yuanbin', name: 'Yuanbin' },
 ];
 
 // The live registry, loaded from the database at boot and appended to when
