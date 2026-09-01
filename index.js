@@ -85,10 +85,18 @@ client.on('authenticated', () => {
 });
 
 client.on('ready', () => {
-  isReady = true;
-  statusText = 'Connected.';
+  statusText = 'Connected — syncing chats...';
   latestQr = null;
-  console.log('WhatsApp client is ready.');
+  console.log('WhatsApp client is ready. Waiting for store to settle...');
+  // WhatsApp Web's internal chat/message store isn't always usable the
+  // instant 'ready' fires — calling getChats() too early can throw an
+  // opaque, minified error from inside the injected page script. Give it
+  // a short grace period before exposing the app as fully ready.
+  setTimeout(() => {
+    isReady = true;
+    statusText = 'Connected.';
+    console.log('Store settle period complete — chats should be available.');
+  }, 8000);
 });
 
 client.on('disconnected', (reason) => {
@@ -153,25 +161,33 @@ app.get('/api/status', (req, res) => {
 
 app.get('/api/chats', async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'Client not ready yet' });
-  try {
-    console.log('Fetching chats...');
-    const chats = await client.getChats();
-    console.log(`Fetched ${chats.length} chats.`);
-    res.json(
-      chats.map((c) => ({
-        id: c.id._serialized,
-        name: c.name || c.id.user,
-        isGroup: c.isGroup,
-        unreadCount: c.unreadCount,
-        lastMessage: c.lastMessage
-          ? { body: c.lastMessage.body, timestamp: c.lastMessage.timestamp * 1000 }
-          : null
-      }))
-    );
-  } catch (err) {
-    console.error('getChats() failed:', err);
-    res.status(500).json({ error: String(err) });
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`Fetching chats (attempt ${attempt})...`);
+      const chats = await client.getChats();
+      console.log(`Fetched ${chats.length} chats.`);
+      return res.json(
+        chats.map((c) => ({
+          id: c.id._serialized,
+          name: c.name || c.id.user,
+          isGroup: c.isGroup,
+          unreadCount: c.unreadCount,
+          lastMessage: c.lastMessage
+            ? { body: c.lastMessage.body, timestamp: c.lastMessage.timestamp * 1000 }
+            : null
+        }))
+      );
+    } catch (err) {
+      lastErr = err;
+      console.error(`getChats() attempt ${attempt} failed:`, err && err.stack ? err.stack : err);
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
   }
+  res.status(500).json({ error: 'Chat store not ready yet — WhatsApp may still be syncing. Try again shortly.' });
 });
 
 app.get('/api/chats/:id/messages', async (req, res) => {
