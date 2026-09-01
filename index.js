@@ -3,6 +3,8 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const auth = require('./auth');
+const views = require('./views');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
@@ -144,30 +146,88 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// ---- Authentication ----
+// Railway (and most PaaS) terminate TLS at a proxy, so trust the
+// X-Forwarded-* headers to get the real client IP and protocol.
+app.set('trust proxy', 1);
+app.use(express.urlencoded({ extended: false }));
+
+// The stylesheet holds no private data and is needed by the login page
+// itself, so it is served before the auth gate.
+app.get('/assets/app.css', (req, res) => {
+  res.type('text/css').set('Cache-Control', 'public, max-age=3600').send(views.STYLES);
+});
+
+app.get('/assets/icon.svg', (req, res) => {
+  res.type('image/svg+xml').set('Cache-Control', 'public, max-age=86400').send(views.FAVICON);
+});
+
+app.get('/favicon.ico', (req, res) => res.redirect(301, '/assets/icon.svg'));
+
+app.get('/login', (req, res) => {
+  if (!auth.isConfigured) return res.status(503).send(views.setupPage());
+  if (auth.isLoggedIn(req)) return res.redirect(auth.safeNextPath(req.query.next));
+  res.send(views.loginPage({ next: auth.safeNextPath(req.query.next) }));
+});
+
+app.post('/login', (req, res) => {
+  if (!auth.isConfigured) return res.status(503).send(views.setupPage());
+
+  const next = auth.safeNextPath(req.body && req.body.next);
+  const lockedFor = auth.lockoutRemainingMs(req);
+
+  if (lockedFor > 0) {
+    const minutes = Math.ceil(lockedFor / 60000);
+    return res.status(429).send(
+      views.loginPage({
+        next,
+        error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`
+      })
+    );
+  }
+
+  if (!auth.passwordMatches(req.body && req.body.password)) {
+    auth.recordFailure(req);
+    console.warn(`Failed login attempt from ${req.ip}`);
+    return res.status(401).send(views.loginPage({ next, error: 'Incorrect password.' }));
+  }
+
+  auth.clearFailures(req);
+  auth.setSessionCookie(req, res);
+  res.redirect(next);
+});
+
+app.post('/logout', (req, res) => {
+  auth.clearSessionCookie(req, res);
+  res.redirect('/login');
+});
+
+// Everything below this line requires a valid session.
+app.use((req, res, next) => {
+  const wantsJson = req.path.startsWith('/api/');
+
+  if (!auth.isConfigured) {
+    return wantsJson
+      ? res.status(503).json({ error: 'APP_PASSWORD is not configured on the server' })
+      : res.status(503).send(views.setupPage());
+  }
+  if (auth.isLoggedIn(req)) return next();
+
+  if (wantsJson) return res.status(401).json({ error: 'Not authenticated' });
+  res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));
+});
+
 // ---- Web routes ----
+
+// Home page: pick which person's inbox to view
+app.get('/', (req, res) => {
+  res.send(views.homePage(USERS));
+});
 
 app.get('/:userId/qr', (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
-  const state = sessions.get(user.id);
-
-  if (state.isReady) {
-    return res.send(
-      `<h2>${user.name} is already connected. No QR code needed.</h2><p><a href="/${user.id}">Go to viewer</a></p>`
-    );
-  }
-  if (!state.latestQr) {
-    return res.send('<h2>Waiting for QR code...</h2><p>Refresh in a few seconds.</p>');
-  }
-  res.send(`
-    <html>
-      <body style="font-family: sans-serif; text-align: center; padding-top: 40px;">
-        <h2>${user.name}: scan with WhatsApp → Linked Devices</h2>
-        <img src="${state.latestQr}" alt="QR code" />
-        <p>${state.statusText}</p>
-      </body>
-    </html>
-  `);
+  res.send(views.qrPage({ user, state: sessions.get(user.id) }));
 });
 
 app.get('/api/:userId/status', (req, res) => {
@@ -239,131 +299,21 @@ app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
   }
 });
 
-// Home page: pick which person's inbox to view
-app.get('/', (req, res) => {
-  const links = USERS.map(
-    (u) => `<li><a href="/${u.id}">${u.name}</a> — <a href="/${u.id}/qr">scan QR</a></li>`
-  ).join('');
-  res.send(`
-    <html>
-      <body style="font-family: sans-serif; padding: 40px;">
-        <h2>WhatsApp Viewer</h2>
-        <ul>${links}</ul>
-      </body>
-    </html>
-  `);
-});
-
 app.get('/:userId', (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
-
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>WhatsApp Viewer — ${user.name}</title>
-  <style>
-    body { font-family: -apple-system, sans-serif; margin: 0; display: flex; height: 100vh; }
-    #sidebar { width: 280px; border-right: 1px solid #ddd; overflow-y: auto; }
-    #sidebar div.chat { padding: 12px; cursor: pointer; border-bottom: 1px solid #eee; }
-    #sidebar div.chat:hover { background: #f5f5f5; }
-    #main { flex: 1; display: flex; flex-direction: column; }
-    #messages { flex: 1; overflow-y: auto; padding: 16px; }
-    .msg { margin-bottom: 10px; max-width: 60%; padding: 8px 12px; border-radius: 8px; }
-    .msg.mine { background: #dcf8c6; margin-left: auto; }
-    .msg.theirs { background: #f0f0f0; }
-    .meta { font-size: 11px; color: #888; margin-top: 4px; }
-    #status { padding: 8px 16px; background: #fafafa; border-bottom: 1px solid #ddd; font-size: 13px; }
-    #backlink { display: block; padding: 8px 16px; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <div id="sidebar">
-    <a id="backlink" href="/">&larr; All users</a>
-    <div id="chatList">Loading chats...</div>
-  </div>
-  <div id="main">
-    <div id="status">Checking status...</div>
-    <div id="messages"><p>Select a chat to view messages.</p></div>
-  </div>
-  <script>
-    const userId = ${JSON.stringify(user.id)};
-
-    async function checkStatus() {
-      const res = await fetch('/api/' + userId + '/status');
-      const data = await res.json();
-      document.getElementById('status').textContent = data.status;
-      if (!data.ready) {
-        if (data.hasQr) {
-          document.getElementById('status').innerHTML += ' — <a href="/' + userId + '/qr" target="_blank">Scan QR code</a>';
-        }
-        setTimeout(checkStatus, 3000);
-        return false;
-      }
-      return true;
-    }
-
-    async function loadChats() {
-      const ready = await checkStatus();
-      if (!ready) { setTimeout(loadChats, 3000); return; }
-      const list = document.getElementById('chatList');
-      try {
-        const res = await fetch('/api/' + userId + '/chats');
-        const data = await res.json();
-        if (!res.ok || !Array.isArray(data)) {
-          console.error('Chats fetch failed:', data);
-          list.innerHTML = '<div style="padding:12px;color:#c00;">' +
-            'Could not load chats yet: ' + (data.error || 'unknown error') +
-            '<br><small>Retrying in 5s...</small></div>';
-          setTimeout(loadChats, 5000);
-          return;
-        }
-        list.innerHTML = '';
-        if (data.length === 0) {
-          list.innerHTML = '<div style="padding:12px;color:#888;">No chats found yet. Retrying...</div>';
-          setTimeout(loadChats, 5000);
-          return;
-        }
-        data.forEach((chat) => {
-          const div = document.createElement('div');
-          div.className = 'chat';
-          div.textContent = chat.name + (chat.unreadCount ? ' (' + chat.unreadCount + ')' : '');
-          div.onclick = () => loadMessages(chat.id, chat.name);
-          list.appendChild(div);
-        });
-      } catch (err) {
-        console.error('Chats fetch threw:', err);
-        list.innerHTML = '<div style="padding:12px;color:#c00;">Error loading chats: ' + err.message +
-          '<br><small>Retrying in 5s...</small></div>';
-        setTimeout(loadChats, 5000);
-      }
-    }
-
-    async function loadMessages(chatId, chatName) {
-      const res = await fetch('/api/' + userId + '/chats/' + encodeURIComponent(chatId) + '/messages');
-      const msgs = await res.json();
-      const container = document.getElementById('messages');
-      container.innerHTML = '<h3>' + chatName + '</h3>';
-      msgs.forEach((m) => {
-        const div = document.createElement('div');
-        div.className = 'msg ' + (m.fromMe ? 'mine' : 'theirs');
-        div.innerHTML = '<div>' + (m.body || '<i>[media/no text]</i>') + '</div>' +
-          '<div class="meta">' + m.fromName + ' · ' + new Date(m.timestamp).toLocaleString() + '</div>';
-        container.appendChild(div);
-      });
-      container.scrollTop = container.scrollHeight;
-    }
-
-    loadChats();
-  </script>
-</body>
-</html>
-  `);
+  res.send(views.viewerPage(user));
 });
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
   console.log('Users configured:', USERS.map((u) => u.id).join(', '));
+  if (auth.isConfigured) {
+    console.log('Password protection: ON (APP_PASSWORD is set).');
+  } else {
+    console.warn(
+      'Password protection: NOT CONFIGURED. Every page is locked until you ' +
+        'set an APP_PASSWORD environment variable and restart.'
+    );
+  }
 });
