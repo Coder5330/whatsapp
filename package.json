@@ -1,7 +1,7 @@
 {
   "name": "wa-viewer",
   "version": "1.0.0",
-  "description": "Minimal WhatsApp message viewer using whatsapp-web.js",
+  "description": "Minimal multi-user WhatsApp message viewer built on Baileys",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -9,9 +9,9 @@
     "reset-inbox": "node reset-inbox.js"
   },
   "dependencies": {
+    "baileys": "^6.7.24",
     "express": "^4.21.1",
     "pg": "^8.13.1",
-    "qrcode": "^1.5.4",
-    "whatsapp-web.js": "github:carlosalaniz/whatsapp-web.js#fix/lid-getchats-crash"
+    "qrcode": "^1.5.4"
   }
 }

@@ -1,22 +1,24 @@
 # WhatsApp Viewer (multi-user)
 
-Minimal WhatsApp message viewer built on `whatsapp-web.js`. Runs one headless
-Chromium session per hardcoded person, each logged into their own WhatsApp
-account, and serves a simple web UI per person to browse their chats.
+Minimal WhatsApp message viewer. Each person links their own WhatsApp
+account, sets their own password, and browses their own chats.
 
-**Important:** this uses an unofficial library that automates WhatsApp Web.
-It's not sanctioned by Meta and could, in principle, get an account flagged
-if it behaves too much like a bot. Use it for a personal viewer, not for
-anything high-volume or automated.
+It runs on [Baileys](https://github.com/WhiskeySockets/Baileys), which
+speaks WhatsApp's protocol over a WebSocket. There is no browser: the
+previous version drove a headless Chromium against web.whatsapp.com, which
+cost roughly 250MB per person and stopped being able to link at all once
+WhatsApp's web client moved on from what the library expected.
 
-**Also important — currently pinned to an unmerged fix.** `package.json`
-points `whatsapp-web.js` at a GitHub branch
-(`carlosalaniz/whatsapp-web.js#fix/lid-getchats-crash`) instead of the
-official npm release, because of a live upstream bug
-([wwebjs#201845](https://github.com/wwebjs/whatsapp-web.js/issues/201845))
-where `getChats()` throws a minified `r: r` error after a recent WhatsApp
-Web update. Once that fix is merged and released to npm, switch back to a
-normal version range for long-term stability.
+Baileys keeps nothing of its own — no chat list, no history — so everything
+the socket reports is written to Postgres and the viewer reads from there.
+That means history survives a restart instead of being re-synced on every
+boot, and the chat list loads whether or not the connection happens to be
+up at that moment.
+
+**Important:** this uses an unofficial library. It is not sanctioned by
+Meta and could, in principle, get an account flagged if it behaves too much
+like a bot. Use it for a personal viewer, not for anything high-volume or
+automated.
 
 ## Passwords — one per inbox, set by its owner
 
@@ -100,9 +102,9 @@ Use the **Add an inbox** form on the home page. Type a name, and you go
 straight to a QR code — scan it with WhatsApp, and the setup code appears so
 you can choose your own password. Nothing to edit, no redeploy.
 
-**Four inboxes at once, maximum.** Each one runs its own headless Chromium
-(roughly 150–300MB), so the cap is a memory ceiling as much as a policy. To
-change it, edit `MAX_INBOXES` in `db.js`.
+**Four inboxes at once, maximum.** This is now a policy rather than a
+memory ceiling — each connection is a WebSocket costing tens of MB, not a
+browser costing hundreds. To change it, edit `MAX_INBOXES` in `db.js`.
 
 The name becomes a URL slug — "Dan Lee" becomes `dan-lee` — used for:
 - QR page: `/<id>/qr`
@@ -115,8 +117,8 @@ boot, so their existing linked sessions keep working.
 Ids are always lowercase. An earlier version seeded them straight from the
 hardcoded list, which used capitals (`Marshall`), and because Postgres text
 keys are case-sensitive that could leave both `Marshall` and `marshall` in
-the table — two inboxes, two Chromium instances, one of them pointing at an
-empty session. On boot the app now folds any mixed-case row down onto its
+the table — two inboxes, two connections, one of them pointing at an empty
+session. On boot the app now folds any mixed-case row down onto its
 lowercase id, keeping whichever of the two had a password actually set, and
 moves the session directory to match. If both directories hold a real
 session it refuses to overwrite either and says so in the logs; check for
@@ -133,7 +135,7 @@ INVITE_CODE='something-only-your-friends-know'
 ```
 
 Worth doing on a public URL — a stranger cannot read anyone's messages, but
-they can burn a slot and start a Chromium instance on your server.
+they can burn a slot and open a WhatsApp connection from your server.
 
 ### Removing one
 
@@ -203,48 +205,16 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 
 ## Notes / limitations
 
-- Each linked person runs their own headless Chromium instance
-  simultaneously — this uses meaningfully more RAM per person (roughly
-  150–300MB each). Keep an eye on Railway's memory graph as you add people;
-  you may need to bump the service's plan/resources. **Four inboxes needs
-  roughly 1GB.** When memory runs short, WhatsApp Web's injection step times
-  out with `Waiting failed: 30000ms exceeded` and that inbox shows "WhatsApp
-  did not start" instead of a QR code.
-- Inboxes start 8 seconds apart rather than all at once, because several
-  Chromium instances launching together starve each other into exactly that
-  timeout. The last inbox is therefore ready a little after the first.
-- **`MAX_ACTIVE_INBOXES=0`** pauses linking entirely: no browsers, no QR
-  codes, no pairing attempts, while the web UI keeps running. WhatsApp limits
-  how often an account may link a device, and an app left showing codes
-  spends that allowance whether or not anyone is watching — so pause it
-  rather than letting it retry while you work out what is wrong.
-- **`WHATSAPP_WEB_VERSION`** pins WhatsApp Web to a specific build, fetched
-  from the wa-version archive, instead of using whatever WhatsApp serves
-  today. `whatsapp-web.js` injects into WhatsApp Web's own page, so a
-  WhatsApp update can break it; the library records the build it was
-  developed against in `DefaultOptions.webVersion`, and pinning to that is
-  worth trying when pairing completes on the phone but never signs in here.
-- **`MAX_ACTIVE_INBOXES`** caps how many run a browser at once (unset = all).
-  Starvation does not fail cleanly: pages freeze, the QR stops rotating —
-  watch the `(#1, #2, #3…)` counter in the logs, a code that never reaches #2
-  is a frozen page — injection times out, and scans silently do nothing.
-  Setting this to 1 is also the quickest way to tell a memory problem from a
-  WhatsApp one: if a single inbox links fine and three do not, it is memory.
-- A client that fails to start is retried five times with backoff, and the
-  failure is confined to that one inbox — the server keeps serving the
-  others rather than exiting.
-- If WhatsApp signs a device out (`LOGOUT`, `UNPAIRED`, `CONFLICT` — someone
-  removed it under **Linked Devices**, or the link sat offline too long) the
-  stored session is revoked and can never work again. That inbox parks the
-  dead session under `<id>.loggedout-<timestamp>`, restarts itself, and shows
-  a fresh QR code to re-link. **The inbox password is unaffected**, so there
-  is no setup code to enter again — just scan. One previous parked session is
-  kept per inbox and older ones are pruned.
-- Media is downloaded on demand through the server, so opening a chat full
-  of large photos uses bandwidth and memory on the service, not just in the
-  browser.
-- `fetchMessages` pulls up to 100 recent messages per chat on open; older
-  history depends on what WhatsApp Web itself has synced.
+- Each connection is a WebSocket rather than a browser, so an inbox costs
+  tens of MB rather than hundreds. `MAX_ACTIVE_INBOXES` still exists but
+  should not normally be needed; `0` pauses linking entirely.
+- History is whatever WhatsApp sends on link. A newly linked account syncs
+  in the background and can take a few minutes to fill in, so the chat list
+  may be empty or partial at first.
+- Media is not stored — only the message describing it. The bytes are
+  fetched from WhatsApp on demand and cached in memory (40 items / 64MB).
+  WhatsApp expires media after a while, so older messages can show
+  "unavailable" where the file is simply gone.
 - Whoever runs the service can still read everything: they control the
   server, the session files, and the database. Per-inbox passwords keep
   people out of *each other's* messages, not out of the operator's reach.
@@ -255,17 +225,8 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
   service restarts and isn't shared across replicas.
 - There is no password reset by email — recovery is `npm run reset-inbox`,
   which needs access to the deployment.
-- The WhatsApp Web page is never cached. `whatsapp-web.js` defaults to a
-  `local` cache that snapshots the page whenever its injection step fails,
-  files it under the WhatsApp Web build the library was released against,
-  and then serves that snapshot on every later start instead of the live
-  page. One failed start therefore pins the app to a frozen copy of
-  WhatsApp Web, and a phone refuses to link against a stale build — "can't
-  link new devices right now" — even while the same account links fine in a
-  real browser. `webVersionCache: { type: 'none' }` keeps it on the live
-  page. Each inbox logs the build and browser it ended up on
-  (`WhatsApp Web build ... via ...`), which is the first thing to check if
-  linking misbehaves.
-- If the WhatsApp Web protocol changes, `whatsapp-web.js` sometimes needs a
-  library update to keep working — keep an eye on its GitHub releases/issues
-  if things break again.
+- The protocol version is fetched from WhatsApp at connect time rather than
+  hardcoded, so it does not go stale the way a pinned page build did.
+- If WhatsApp changes its protocol, Baileys sometimes needs a library update
+  to keep working — keep an eye on its GitHub releases/issues if things
+  break again.

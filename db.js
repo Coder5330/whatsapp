@@ -62,6 +62,45 @@ CREATE TABLE IF NOT EXISTS inboxes (
   name       TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Baileys speaks WhatsApp's protocol and keeps nothing: no chat list, no
+-- history. Whatever arrives over the socket is ours to store or lose. So
+-- the viewer reads from here rather than from a live client, which also
+-- means history survives a restart instead of being re-synced each boot.
+CREATE TABLE IF NOT EXISTS wa_chats (
+  inbox_id     TEXT NOT NULL,
+  chat_id      TEXT NOT NULL,
+  name         TEXT,
+  is_group     BOOLEAN NOT NULL DEFAULT false,
+  unread_count INTEGER DEFAULT 0,
+  last_ts      BIGINT,
+  last_text    TEXT,
+  last_media   TEXT,
+  PRIMARY KEY (inbox_id, chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS wa_chats_recent ON wa_chats (inbox_id, last_ts DESC);
+
+CREATE TABLE IF NOT EXISTS wa_messages (
+  inbox_id    TEXT NOT NULL,
+  chat_id     TEXT NOT NULL,
+  msg_id      TEXT NOT NULL,
+  from_me     BOOLEAN NOT NULL DEFAULT false,
+  sender_name TEXT,
+  body        TEXT,
+  ts          BIGINT NOT NULL,
+  media_kind  TEXT,
+  raw         JSONB,
+  PRIMARY KEY (inbox_id, msg_id)
+);
+
+CREATE INDEX IF NOT EXISTS wa_messages_thread
+  ON wa_messages (inbox_id, chat_id, ts DESC);
+
+-- Earlier versions declared unread_count NOT NULL. A row derived from a
+-- message has no opinion about unread counts and passes null so it cannot
+-- reset one, which that constraint rejected.
+ALTER TABLE wa_chats ALTER COLUMN unread_count DROP NOT NULL;
 `;
 
 async function init() {
@@ -261,6 +300,166 @@ async function seedInboxes(users) {
   }
 }
 
+// ---- Chats and messages ----
+
+// History sync arrives in bulk, so write in chunks rather than a statement
+// per row; a busy account can produce thousands of messages at once.
+const WRITE_CHUNK = 200;
+
+function chunk(rows) {
+  const out = [];
+  for (let i = 0; i < rows.length; i += WRITE_CHUNK) out.push(rows.slice(i, i + WRITE_CHUNK));
+  return out;
+}
+
+// chats: [{ id, name, isGroup, unreadCount, lastTs, lastText, lastMedia }]
+async function upsertChats(inboxId, chats) {
+  if (!chats.length) return;
+
+  for (const group of chunk(chats)) {
+    const values = [];
+    const params = [];
+    group.forEach((c, i) => {
+      const b = i * 8;
+      values.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8})`);
+      params.push(
+        inboxId, c.id, c.name || null, !!c.isGroup,
+        // null means "no opinion" — a row derived from a message knows the
+        // text and timestamp but nothing about how many are unread, and
+        // must not reset a count the chat list actually reported.
+        c.unreadCount === null || c.unreadCount === undefined
+          ? null
+          : Number(c.unreadCount) || 0,
+        c.lastTs === undefined || c.lastTs === null ? null : String(c.lastTs),
+        c.lastText || null, c.lastMedia || null
+      );
+    });
+
+    // A later sync can carry less detail than an earlier one, so keep the
+    // better value rather than letting a null overwrite a real name or a
+    // newer timestamp go backwards.
+    await getPool().query(
+      `INSERT INTO wa_chats
+         (inbox_id, chat_id, name, is_group, unread_count, last_ts, last_text, last_media)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (inbox_id, chat_id) DO UPDATE SET
+         name         = COALESCE(EXCLUDED.name, wa_chats.name),
+         is_group     = EXCLUDED.is_group,
+         unread_count = COALESCE(EXCLUDED.unread_count, wa_chats.unread_count),
+         last_ts      = GREATEST(COALESCE(EXCLUDED.last_ts, 0), COALESCE(wa_chats.last_ts, 0)),
+         last_text    = CASE WHEN COALESCE(EXCLUDED.last_ts, 0) >= COALESCE(wa_chats.last_ts, 0)
+                             THEN EXCLUDED.last_text ELSE wa_chats.last_text END,
+         last_media   = CASE WHEN COALESCE(EXCLUDED.last_ts, 0) >= COALESCE(wa_chats.last_ts, 0)
+                             THEN EXCLUDED.last_media ELSE wa_chats.last_media END`,
+      params
+    );
+  }
+}
+
+// messages: [{ id, chatId, fromMe, senderName, body, ts, mediaKind, raw }]
+async function upsertMessages(inboxId, messages) {
+  if (!messages.length) return;
+
+  for (const group of chunk(messages)) {
+    const values = [];
+    const params = [];
+    group.forEach((m, i) => {
+      const b = i * 9;
+      values.push(
+        `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9})`
+      );
+      params.push(
+        inboxId, m.chatId, m.id, !!m.fromMe, m.senderName || null,
+        m.body || null, String(m.ts || 0), m.mediaKind || null,
+        m.raw ? JSON.stringify(m.raw) : null
+      );
+    });
+
+    await getPool().query(
+      `INSERT INTO wa_messages
+         (inbox_id, chat_id, msg_id, from_me, sender_name, body, ts, media_kind, raw)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (inbox_id, msg_id) DO UPDATE SET
+         body       = COALESCE(EXCLUDED.body, wa_messages.body),
+         media_kind = COALESCE(EXCLUDED.media_kind, wa_messages.media_kind),
+         raw        = COALESCE(EXCLUDED.raw, wa_messages.raw)`,
+      params
+    );
+  }
+}
+
+async function listChats(inboxId, limit = 200) {
+  const { rows } = await getPool().query(
+    `SELECT chat_id, name, is_group, unread_count, last_ts, last_text, last_media
+       FROM wa_chats
+      WHERE inbox_id = $1
+      ORDER BY last_ts DESC NULLS LAST
+      LIMIT $2`,
+    [inboxId, limit]
+  );
+  return rows.map((r) => ({
+    id: r.chat_id,
+    name: r.name || r.chat_id.split('@')[0],
+    isGroup: r.is_group,
+    unreadCount: r.unread_count || 0,
+    lastMessage: r.last_ts
+      ? {
+          body: r.last_text || '',
+          timestamp: Number(r.last_ts) * 1000,
+          hasMedia: !!r.last_media,
+          mediaKind: r.last_media
+        }
+      : null
+  }));
+}
+
+async function listMessages(inboxId, chatId, limit = 100) {
+  const { rows } = await getPool().query(
+    `SELECT msg_id, from_me, sender_name, body, ts, media_kind
+       FROM wa_messages
+      WHERE inbox_id = $1 AND chat_id = $2
+      ORDER BY ts DESC
+      LIMIT $3`,
+    [inboxId, chatId, limit]
+  );
+  // Newest first out of the database so the LIMIT keeps recent messages;
+  // the viewer wants them oldest first.
+  return rows.reverse().map((r) => ({
+    id: r.msg_id,
+    fromMe: r.from_me,
+    fromName: r.from_me ? 'You' : r.sender_name || 'Unknown',
+    body: r.body || '',
+    timestamp: Number(r.ts) * 1000,
+    hasMedia: !!r.media_kind,
+    mediaKind: r.media_kind
+  }));
+}
+
+// The stored protocol message, needed to download its media later.
+async function getMessageRaw(inboxId, msgId) {
+  const { rows } = await getPool().query(
+    'SELECT raw, media_kind FROM wa_messages WHERE inbox_id = $1 AND msg_id = $2',
+    [inboxId, msgId]
+  );
+  if (rows.length === 0) return null;
+  return { raw: rows[0].raw, mediaKind: rows[0].media_kind };
+}
+
+async function countChats(inboxId) {
+  const { rows } = await getPool().query(
+    'SELECT count(*)::int AS n FROM wa_chats WHERE inbox_id = $1',
+    [inboxId]
+  );
+  return rows[0].n;
+}
+
+// Used when an inbox is unlinked: its history belongs to a WhatsApp account
+// that is no longer connected here.
+async function clearInboxHistory(inboxId) {
+  await getPool().query('DELETE FROM wa_messages WHERE inbox_id = $1', [inboxId]);
+  await getPool().query('DELETE FROM wa_chats WHERE inbox_id = $1', [inboxId]);
+}
+
 async function close() {
   if (pool) await pool.end();
 }
@@ -281,5 +480,12 @@ module.exports = {
   claimInbox,
   updatePassword,
   resetInbox,
+  upsertChats,
+  upsertMessages,
+  listChats,
+  listMessages,
+  getMessageRaw,
+  countChats,
+  clearInboxHistory,
   close
 };

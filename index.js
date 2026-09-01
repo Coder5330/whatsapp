@@ -2,7 +2,7 @@ const express = require('express');
 const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const wa = require('./wa');
 const auth = require('./auth');
 const db = require('./db');
 const views = require('./views');
@@ -15,20 +15,6 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // are inserted on first boot and then live in the `inboxes` table like any
 // other; their ids must not change, because each one names a session folder
 // on the volume that is already linked to a real WhatsApp account.
-// Exactly the flags this app ran with when linking worked. Six more were
-// added here once to trim memory, on no evidence that they helped, and
-// linking stopped working in the same commit: --no-zygote in particular
-// disables the process Chromium forks renderers from, and a renderer dying
-// mid-pairing surfaces as "Target closed", "detached Frame", and a LOGOUT
-// that looks for all the world like WhatsApp rejecting the device. Do not
-// add to this list without a measurement showing it is needed.
-const PUPPETEER_ARGS = [
-  '--no-sandbox',
-  '--disable-setuid-sandbox',
-  '--disable-dev-shm-usage',
-  '--disable-gpu'
-];
-
 const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
   { id: 'marshall', name: 'Marshall' },
@@ -61,42 +47,6 @@ function isSafeInboxId(id) {
   return typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id);
 }
 
-// Chromium writes a SingletonLock (and related Singleton* files) into its
-// profile directory while running. If the container is killed or crashes
-// without Chromium shutting down cleanly, those files are left behind on
-// the persistent volume. On the next boot Chromium sees the stale lock and
-// refuses to start, thinking another process still owns the profile — even
-// though that process is long gone. Clear them before every launch.
-function clearStaleChromiumLocks(rootDir) {
-  if (!fs.existsSync(rootDir)) return;
-  const lockNames = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
-  const stack = [rootDir];
-  while (stack.length) {
-    const dir = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-      } else if (lockNames.has(entry.name)) {
-        try {
-          fs.unlinkSync(full);
-          console.log('Removed stale Chromium lock file:', full);
-        } catch (err) {
-          console.warn('Could not remove lock file:', full, err.message);
-        }
-      }
-    }
-  }
-}
-
-clearStaleChromiumLocks(SESSION_ROOT);
-
 const app = express();
 
 // ---- Per-user state, keyed by user id ----
@@ -108,310 +58,10 @@ const sessions = new Map();
 // rather than exceptional. Retry it with backoff, and never let the
 // rejection escape: an uncaught one takes the whole server down, and then
 // nobody can reach any inbox.
-const MAX_STARTUP_ATTEMPTS = 5;
-const STARTUP_BASE_DELAY_MS = 5000;
-
-function buildClient(user, state) {
-  const sessionPath = path.join(SESSION_ROOT, user.id);
-
-  const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: sessionPath }),
-    // Never replay a cached copy of WhatsApp Web.
-    //
-    // The default 'local' cache writes a snapshot of the page whenever
-    // injection fails, filed under the WhatsApp Web build the library was
-    // released against. Every later start then finds that file, intercepts
-    // the request to web.whatsapp.com, and serves the snapshot instead of
-    // the live page — so one failed start pins the app to a frozen copy of
-    // WhatsApp Web for good. A phone will refuse to link against a stale
-    // build ("can't link new devices right now") even though the same
-    // account links fine in a real browser.
-    //
-    // 'none' resolves to no cached content, which leaves the real request
-    // alone and loads whatever WhatsApp is serving today. WHATSAPP_WEB_VERSION
-    // swaps this for a pinned build instead.
-    ...webVersionOptions,
-    puppeteer: {
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: PUPPETEER_ARGS
-    }
-  });
-
-  client.on('qr', async (qr) => {
-    state.statusText = 'Scan the QR code below with WhatsApp on your phone.';
-    state.sawQrThisRun = true;
-    state.startupError = null;
-
-    // The QR is the earliest point where the page has loaded enough to ask
-    // what it is. A client stuck here never reaches 'ready', so reporting
-    // only there told us nothing in exactly the case we needed it.
-    if (!state.loggedEnvironment) {
-      state.loggedEnvironment = true;
-      Promise.all([
-        client.getWWebVersion().catch((e) => `unknown (${e.message})`),
-        client.pupBrowser && client.pupBrowser.version
-          ? client.pupBrowser.version().catch(() => 'unknown')
-          : Promise.resolve('unknown')
-      ])
-        .then(([web, browser]) => {
-          console.log(`[${user.id}] WhatsApp Web build ${web} via ${browser}`);
-        })
-        .catch(() => {});
-    }
-
-    // Log every rotation. WhatsApp reissues the code every 20s or so, and a
-    // page that stops rotating has frozen — which looks identical to a
-    // working one in a screenshot, but no scan will ever succeed against it.
-    state.qrCount = (state.qrCount || 0) + 1;
-    try {
-      state.latestQr = await qrcode.toDataURL(qr);
-    } catch (err) {
-      console.error(`[${user.id}] Could not render QR code:`, err.message);
-      return;
-    }
-    console.log(`[${user.id}] QR code updated (#${state.qrCount}). Visit /${user.id}/qr to scan it.`);
-  });
-
-  client.on('authenticated', () => {
-    state.statusText = 'Linked. Finishing sign-in...';
-    state.latestQr = null;
-    state.startupError = null;
-    state.needsRelink = false;
-    state.everAuthenticated = true;
-    state.pairingFailures = 0;
-    // Between here and 'ready' the QR is gone but the inbox is not usable
-    // yet. Without a flag for it the page falls back to "Generating QR
-    // code..." — so a scan that just succeeded looks like one that hung.
-    state.authenticating = true;
-    // Linking WhatsApp is what proves this inbox belongs to whoever is
-    // holding the phone, so that is the moment a setup code is worth
-    // issuing — but only while nobody has set a password yet.
-    issueClaimCodeIfNeeded(user, state);
-  });
-
-  client.on('ready', () => {
-    state.statusText = 'Connected — syncing chats...';
-    state.latestQr = null;
-    state.startupError = null;
-    console.log(`[${user.id}] Client ready. Waiting for store to settle...`);
-
-    clearTimeout(state.settleTimer);
-    state.settleTimer = setTimeout(() => {
-      // This fires eight seconds after the client said it was ready, which
-      // is long enough for the client to have been signed out and replaced
-      // in the meantime. Only the client that is still current may mark the
-      // inbox connected, or a dead session comes back to life and the UI
-      // cheerfully reports "connected" for a browser that is gone.
-      if (state.client !== client) {
-        console.log(`[${user.id}] Ignoring settle timer from a replaced client.`);
-        return;
-      }
-      state.isReady = true;
-      state.authenticating = false;
-      state.statusText = 'Connected.';
-      console.log(`[${user.id}] Store settle period complete.`);
-      // Which WhatsApp Web build we actually ended up on, and on what
-      // browser — the two things worth knowing when linking misbehaves.
-      Promise.all([
-        client.getWWebVersion().catch(() => 'unknown'),
-        client.pupBrowser && client.pupBrowser.version
-          ? client.pupBrowser.version().catch(() => 'unknown')
-          : Promise.resolve('unknown')
-      ])
-        .then(([web, browser]) => {
-          console.log(`[${user.id}] WhatsApp Web build ${web} via ${browser}`);
-        })
-        .catch(() => {});
-    }, 8000);
-  });
-
-  client.on('disconnected', (reason) => {
-    console.log(`[${user.id}] Client disconnected:`, reason);
-    handleDisconnect(user, state, reason);
-  });
-
-  return client;
-}
-
-// WhatsApp tells us why the device dropped. These reasons mean the linked
-// device was revoked — the stored session can never work again, and the only
-// way back is a fresh scan. Anything else may just be a blip worth retrying
-// on the existing session.
-const UNLINKED_REASONS = new Set(['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 'CONFLICT']);
-
-// Move a dead session out of the way rather than deleting it: the auth blob
-// is worthless once revoked, but it sits next to cached message data, and
-// this runs without anyone watching. Keep one previous copy per inbox so the
-// volume cannot fill up with them.
-function parkDeadSession(id) {
-  const live = path.join(SESSION_ROOT, id);
-  if (!fs.existsSync(live)) return;
-
-  try {
-    fs.renameSync(live, path.join(SESSION_ROOT, `${id}.loggedout-${Date.now()}`));
-    console.log(`[${id}] Parked the revoked session; a fresh QR code will be generated.`);
-  } catch (err) {
-    console.warn(`[${id}] Could not park the revoked session:`, err.message);
-    return;
-  }
-
-  try {
-    const stale = fs
-      .readdirSync(SESSION_ROOT)
-      .filter((name) => name.startsWith(`${id}.loggedout-`))
-      .sort();
-    for (const name of stale.slice(0, -1)) {
-      fs.rmSync(path.join(SESSION_ROOT, name), { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.warn(`[${id}] Could not prune old parked sessions:`, err.message);
-  }
-}
-
-// A disconnect used to be terminal: the client was dead, no QR was ever
-// produced, and the page sat on its spinner telling people to restart the
-// service. Recover on our own instead.
-// How many times an inbox may disconnect without ever having authenticated
-// before we stop regenerating codes. Each cycle is a fresh pairing attempt
-// against WhatsApp, and hammering that is what gets an account told it
-// "can't link new devices right now".
-const MAX_PAIRING_ATTEMPTS = 3;
-
-async function handleDisconnect(user, state, reason) {
-  if (state.restarting) return;
-  state.restarting = true;
-
-  clearTimeout(state.settleTimer);
-  state.isReady = false;
-  state.authenticating = false;
-  state.latestQr = null;
-
-  // Three different things arrive as the same LOGOUT, and which one it is
-  // decides whether the stored session may be thrown away. Whether a QR has
-  // been shown yet in this run is what separates them:
-  //
-  //   before any QR   -> we were restoring the saved session and WhatsApp
-  //                      rejected it. Those credentials are provably dead
-  //                      (the device was unpaired, say), so clear them or
-  //                      every restart repeats this.
-  //   after a QR      -> someone scanned and the pairing did not complete.
-  //                      The credentials here are the ones that scan just
-  //                      created; discarding them is what made a linked
-  //                      phone never sign in.
-  //   after authenticating -> a session that was genuinely working has been
-  //                      revoked. Clear it and ask for a new scan.
-  const unlinkedReason = UNLINKED_REASONS.has(String(reason));
-  const revoked = unlinkedReason && state.everAuthenticated;
-  const storedSessionRejected = unlinkedReason && !state.everAuthenticated && !state.sawQrThisRun;
-  const pairingFailed = unlinkedReason && !state.everAuthenticated && state.sawQrThisRun;
-
-  if (storedSessionRejected) {
-    console.warn(
-      `[${user.id}] The stored session was rejected (${reason}) before any code was shown — ` +
-        'it is no longer valid, most likely unpaired from the phone. Clearing it.'
-    );
-  }
-
-  if (pairingFailed) {
-    state.pairingFailures = (state.pairingFailures || 0) + 1;
-    console.warn(
-      `[${user.id}] Disconnected (${reason}) after a scan but before signing in — treating as a ` +
-        `failed pairing (${state.pairingFailures}/${MAX_PAIRING_ATTEMPTS}), keeping the stored session.`
-    );
-  }
-
-  state.needsRelink = revoked || storedSessionRejected;
-  state.statusText = revoked
-    ? `WhatsApp signed this device out (${reason}). Scan the new code to re-link.`
-    : storedSessionRejected
-      ? 'The saved WhatsApp link is no longer valid. Scan the new code to link again.'
-      : `Disconnected (${reason}). Reconnecting...`;
-
-  try {
-    if (state.client) await state.client.destroy();
-  } catch {
-    /* the browser is usually already gone by the time we hear about it */
-  }
-
-  // Both of these mean the stored credentials cannot work again.
-  if (revoked || storedSessionRejected) parkDeadSession(user.id);
-
-  if (pairingFailed && state.pairingFailures >= MAX_PAIRING_ATTEMPTS) {
-    state.startupError =
-      `Pairing kept failing (${reason}). WhatsApp accepted the scan but this end never ` +
-      'finished signing in.';
-    state.statusText =
-      'Pairing is not completing. Restart the service to try again, rather than rescanning.';
-    state.restarting = false;
-    console.error(
-      `[${user.id}] Giving up after ${state.pairingFailures} failed pairings. Not generating ` +
-        'another code — repeated attempts are what get an account blocked from linking.'
-    );
-    return;
-  }
-
-  state.attempts = 0;
-  state.sawQrThisRun = false;
-  state.restarting = false;
-
-  startSession(user, state).catch((err) =>
-    console.error(`[${user.id}] Reconnect failed:`, err && err.message)
-  );
-}
-
-async function startSession(user, state) {
-  state.attempts += 1;
-
-  // A half-initialised client cannot be re-initialised, so each attempt
-  // gets a fresh one.
-  const client = buildClient(user, state);
-  state.client = client;
-  state.statusText = state.needsRelink
-    ? 'Generating a new code to re-link this WhatsApp...'
-    : state.attempts === 1
-      ? 'Starting up...'
-      : `Starting up... (attempt ${state.attempts})`;
-
-  try {
-    await client.initialize();
-    state.startupError = null;
-  } catch (err) {
-    const message = err && err.message ? err.message : String(err);
-    console.error(`[${user.id}] Startup attempt ${state.attempts} failed:`, message);
-    state.startupError = message;
-    clearTimeout(state.settleTimer);
-    state.isReady = false;
-    state.authenticating = false;
-    state.latestQr = null;
-
-    try {
-      await client.destroy();
-    } catch {
-      /* the browser may already be gone; nothing to clean up */
-    }
-
-    if (state.attempts >= MAX_STARTUP_ATTEMPTS) {
-      state.statusText =
-        'WhatsApp did not start after several tries. Restart the service to try again.';
-      console.error(`[${user.id}] Giving up after ${state.attempts} attempts.`);
-      return;
-    }
-
-    const delay = Math.min(60000, STARTUP_BASE_DELAY_MS * 2 ** (state.attempts - 1));
-    state.statusText = `WhatsApp did not start. Retrying in ${Math.round(delay / 1000)}s...`;
-    setTimeout(() => {
-      startSession(user, state).catch((e) =>
-        console.error(`[${user.id}] Retry scheduling failed:`, e && e.message)
-      );
-    }, delay);
-  }
-}
-
-// An inbox held back by MAX_ACTIVE_INBOXES: no browser, no retries, and a
-// status that explains itself.
+// Inboxes held back by MAX_ACTIVE_INBOXES: no connection, no retries, and
+// a status that explains itself.
 function dormantSession() {
   return {
-    client: null,
     latestQr: null,
     isReady: false,
     statusText:
@@ -423,40 +73,24 @@ function dormantSession() {
     attempts: 0,
     needsRelink: false,
     restarting: false,
-    settleTimer: null,
     authenticating: false,
     everAuthenticated: false,
     pairingFailures: 0,
-    dormant: true
+    qrCount: 0,
+    dormant: true,
+    stop: async () => {}
   };
 }
 
-// `startAfterMs` staggers the launches. Starting every Chromium at the same
-// instant is what makes them starve each other and time out.
+// `startAfterMs` staggers connections. Far less important without a browser
+// to launch, but it still spreads out the history sync that follows.
 function createSessionForUser(user, startAfterMs = 0) {
-  const state = {
-    client: null,
-    latestQr: null,
-    isReady: false,
-    statusText: 'Starting up...',
-    // Set once this process has actually displayed a QR code, which is how
-    // we know a later 'authenticated' came from someone scanning it here
-    // rather than from a session restored off the volume.
-    sawQrThisRun: false,
-    claimCodePlain: null,
-    codeVisibleUntil: 0,
-    startupError: null,
-    attempts: 0,
-    needsRelink: false,
-    restarting: false,
-    settleTimer: null,
-    authenticating: false,
-    everAuthenticated: false,
-    pairingFailures: 0
-  };
+  const state = wa.createInboxConnection(user, SESSION_ROOT, {
+    onClaimCode: (u, st) => issueClaimCodeIfNeeded(u, st)
+  });
 
   const launch = () =>
-    startSession(user, state).catch((err) =>
+    state.start().catch((err) =>
       console.error(`[${user.id}] Startup failed unexpectedly:`, err && err.message)
     );
 
@@ -465,7 +99,6 @@ function createSessionForUser(user, startAfterMs = 0) {
 
   return state;
 }
-
 
 function getUserOr404(req, res) {
   const user = findUser(req.params.userId);
@@ -481,11 +114,11 @@ async function shutdown(signal) {
   await Promise.all(
     USERS.map(async (user) => {
       const state = sessions.get(user.id);
-      if (!state || !state.client) return;
+      if (!state || !state.stop) return;
       try {
-        await state.client.destroy();
+        await state.stop();
       } catch (err) {
-        console.warn(`[${user.id}] Error during client.destroy():`, err.message);
+        console.warn(`[${user.id}] Error closing the connection:`, err.message);
       }
     })
   );
@@ -496,10 +129,10 @@ async function shutdown(signal) {
   }
   process.exit(0);
 }
-// whatsapp-web.js drives a browser over a socket, and it surfaces failures
-// asynchronously long after startup. Node's default is to abort on an
-// unhandled rejection, which would take every other inbox down with it, so
-// log and keep serving instead.
+// A dropped socket or a malformed message surfaces asynchronously, long
+// after startup. Node's default is to abort on an unhandled rejection,
+// which would take every other inbox down with it, so log and keep
+// serving instead.
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection:', reason && reason.message ? reason.message : reason);
 });
@@ -926,65 +559,28 @@ app.get('/api/:userId/status', (req, res) => {
 app.get('/api/:userId/chats', async (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
-  const state = sessions.get(user.id);
 
-  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
-
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      console.log(`[${user.id}] Fetching chats (attempt ${attempt})...`);
-      const chats = await state.client.getChats();
-      console.log(`[${user.id}] Fetched ${chats.length} chats.`);
-      return res.json(
-        chats.map((c) => ({
-          id: c.id._serialized,
-          name: c.name || c.id.user,
-          isGroup: c.isGroup,
-          unreadCount: c.unreadCount,
-          lastMessage: c.lastMessage
-            ? {
-                body: c.lastMessage.body,
-                timestamp: c.lastMessage.timestamp * 1000,
-                hasMedia: !!c.lastMessage.hasMedia,
-                mediaKind: mediaKindOf(c.lastMessage)
-              }
-            : null
-        }))
-      );
-    } catch (err) {
-      console.error(`[${user.id}] getChats() attempt ${attempt} failed:`, err && err.stack ? err.stack : err);
-      if (attempt < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 3000));
-      }
+  // Chats come from Postgres rather than the connection, so the list loads
+  // whether or not the socket happens to be up, and history survives a
+  // restart instead of being re-synced every boot.
+  try {
+    const chats = await db.listChats(user.id);
+    if (chats.length === 0) {
+      const state = sessions.get(user.id);
+      return res.status(503).json({
+        error: state && state.isReady
+          ? 'Connected — WhatsApp is still sending history. This can take a few minutes on a busy account.'
+          : 'Not connected yet.'
+      });
     }
+    res.json(chats);
+  } catch (err) {
+    console.error(`[${user.id}] listing chats failed:`, err.message);
+    res.status(500).json({ error: 'Could not read chats' });
   }
-  res.status(500).json({ error: 'Chat store not ready yet — WhatsApp may still be syncing. Try again shortly.' });
 });
 
 // ---- Media ----
-
-// whatsapp-web.js reports a message type per WhatsApp's own vocabulary;
-// collapse it to the handful of shapes the viewer knows how to render.
-function mediaKindOf(msg) {
-  if (!msg.hasMedia) return null;
-  switch (msg.type) {
-    case 'image':
-      return 'image';
-    case 'sticker':
-      return 'sticker';
-    case 'video':
-      return 'video';
-    case 'audio':
-      return 'audio';
-    case 'ptt':
-      return 'voice';
-    case 'document':
-      return 'document';
-    default:
-      return 'file';
-  }
-}
 
 // Downloading is slow enough that a re-render must not re-fetch, but media
 // is large, so the cache is bounded by both count and total bytes and drops
@@ -1025,35 +621,36 @@ const INLINE_MIME = /^(image\/(png|jpeg|gif|webp|bmp)|video\/(mp4|webm|ogg|quick
 app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
-  const state = sessions.get(user.id);
-
-  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
 
   const cacheKey = user.id + '|' + req.params.messageId;
   let entry = cacheGet(cacheKey);
 
   if (!entry) {
+    let stored;
     try {
-      const msg = await state.client.getMessageById(req.params.messageId);
-      if (!msg) return res.status(404).json({ error: 'Message not found' });
-      if (!msg.hasMedia) return res.status(404).json({ error: 'Message has no media' });
+      stored = await db.getMessageRaw(user.id, req.params.messageId);
+    } catch (err) {
+      console.error(`[${user.id}] media lookup failed:`, err.message);
+      return res.status(500).json({ error: 'Could not read that message' });
+    }
+    if (!stored || !stored.raw) return res.status(404).json({ error: 'Message has no media' });
 
-      const media = await msg.downloadMedia();
-      // WhatsApp drops media from its servers after a while; an old message
-      // can legitimately have nothing left to download.
-      if (!media || !media.data) {
+    try {
+      const media = await wa.fetchMedia(stored.raw);
+      if (!media || !media.buffer || media.buffer.length === 0) {
         return res.status(410).json({ error: 'Media is no longer available' });
       }
-
       entry = {
-        buffer: Buffer.from(media.data, 'base64'),
-        mimetype: media.mimetype || 'application/octet-stream',
-        filename: media.filename || null
+        buffer: media.buffer,
+        mimetype: media.mimetype,
+        filename: media.filename
       };
       cachePut(cacheKey, entry);
     } catch (err) {
+      // WhatsApp drops media from its servers after a while, so an old
+      // message can legitimately have nothing left to download.
       console.error(`[${user.id}] media download failed:`, err && err.message ? err.message : err);
-      return res.status(502).json({ error: 'Could not download that media' });
+      return res.status(410).json({ error: 'Could not download that media' });
     }
   }
 
@@ -1070,31 +667,12 @@ app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
 app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
-  const state = sessions.get(user.id);
 
-  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
   try {
-    const chat = await state.client.getChatById(req.params.chatId);
-    const history = await chat.fetchMessages({ limit: 100 });
-    const formatted = await Promise.all(
-      history.map(async (msg) => {
-        const contact = await msg.getContact();
-        return {
-          id: msg.id._serialized,
-          fromMe: msg.fromMe,
-          fromName: msg.fromMe ? 'You' : (contact.pushname || contact.number || 'Unknown'),
-          // For a media message this is the caption, which is often empty.
-          body: msg.body,
-          timestamp: msg.timestamp * 1000,
-          hasMedia: !!msg.hasMedia,
-          mediaKind: mediaKindOf(msg)
-        };
-      })
-    );
-    res.json(formatted);
+    res.json(await db.listMessages(user.id, req.params.chatId));
   } catch (err) {
-    console.error(`[${user.id}] fetchMessages failed:`, err && err.stack ? err.stack : err);
-    res.status(500).json({ error: String(err) });
+    console.error(`[${user.id}] listing messages failed:`, err.message);
+    res.status(500).json({ error: 'Could not read messages' });
   }
 });
 
@@ -1202,18 +780,21 @@ async function reportEffectiveConfig(activeLimit) {
   console.log(
     'Config: ' +
       `inboxes=${activeLimit}/${USERS.length}` +
-      `, browser args=${PUPPETEER_ARGS.length}` +
-      `, webVersion=${WHATSAPP_WEB_VERSION || 'live'}` +
+      `, transport=baileys (no browser)` +
       `, inviteCode=${INVITE_CODE ? 'on' : 'off'}`
   );
-  console.log('Browser args:', PUPPETEER_ARGS.join(' '));
 
   if (!WHATSAPP_WEB_VERSION) return;
+  console.warn(
+    'WHATSAPP_WEB_VERSION is set but no longer does anything — it pinned a page ' +
+      'build for the old browser-based client. Remove it.'
+  );
+  return;
 
   // A pinned build that is not in the archive resolves to nothing and the
   // client quietly loads the live page instead — so claiming it is pinned
   // would be a lie. Check, and say which it is.
-  const url = WHATSAPP_WEB_VERSION_PATH.replace('{version}', WHATSAPP_WEB_VERSION);
+
   try {
     const res = await fetch(url, { method: 'GET' });
     if (res.ok) {
@@ -1242,26 +823,10 @@ const STARTUP_STAGGER_MS = 8000;
 // session is dead but the app cannot tell — after unpairing the device from
 // the phone, say — because there is otherwise no way to clear one without
 // shell access to the volume. Set it, deploy once, then remove it.
-// whatsapp-web.js works by injecting into WhatsApp Web's own page, so it is
-// tied to that page's internals and a WhatsApp update can break it. The
-// library ships the build it was developed against (see DefaultOptions.
-// webVersion) for exactly that reason.
-//
-// Unset, we load whatever WhatsApp serves today. Set WHATSAPP_WEB_VERSION to
-// pin a specific build instead, fetched from the wa-version archive — worth
-// trying when pairing completes on the phone but never signs in here, which
-// is what a version mismatch looks like.
+// Left only to warn if it is still set: it pinned a WhatsApp Web page build
+// for the old browser-based client and has no meaning for a protocol
+// connection, which negotiates its version with WhatsApp directly.
 const WHATSAPP_WEB_VERSION = (process.env.WHATSAPP_WEB_VERSION || '').trim();
-const WHATSAPP_WEB_VERSION_PATH =
-  process.env.WHATSAPP_WEB_VERSION_PATH ||
-  'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
-
-const webVersionOptions = WHATSAPP_WEB_VERSION
-  ? {
-      webVersion: WHATSAPP_WEB_VERSION,
-      webVersionCache: { type: 'remote', remotePath: WHATSAPP_WEB_VERSION_PATH }
-    }
-  : { webVersionCache: { type: 'none' } };
 
 const RESET_SESSIONS = (process.env.RESET_SESSIONS || '')
   .split(',')
