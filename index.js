@@ -104,7 +104,9 @@ app.get('/api/status', (req, res) => {
 app.get('/api/chats', async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'Client not ready yet' });
   try {
+    console.log('Fetching chats...');
     const chats = await client.getChats();
+    console.log(`Fetched ${chats.length} chats.`);
     res.json(
       chats.map((c) => ({
         id: c.id._serialized,
@@ -117,6 +119,7 @@ app.get('/api/chats', async (req, res) => {
       }))
     );
   } catch (err) {
+    console.error('getChats() failed:', err);
     res.status(500).json({ error: String(err) });
   }
 });
@@ -191,17 +194,37 @@ app.get('/', (req, res) => {
     async function loadChats() {
       const ready = await checkStatus();
       if (!ready) { setTimeout(loadChats, 3000); return; }
-      const res = await fetch('/api/chats');
-      const chats = await res.json();
       const list = document.getElementById('chatList');
-      list.innerHTML = '';
-      chats.forEach((chat) => {
-        const div = document.createElement('div');
-        div.className = 'chat';
-        div.textContent = chat.name + (chat.unreadCount ? ' (' + chat.unreadCount + ')' : '');
-        div.onclick = () => loadMessages(chat.id, chat.name);
-        list.appendChild(div);
-      });
+      try {
+        const res = await fetch('/api/chats');
+        const data = await res.json();
+        if (!res.ok || !Array.isArray(data)) {
+          console.error('Chats fetch failed:', data);
+          list.innerHTML = '<div style="padding:12px;color:#c00;">' +
+            'Could not load chats yet: ' + (data.error || 'unknown error') +
+            '<br><small>Retrying in 5s...</small></div>';
+          setTimeout(loadChats, 5000);
+          return;
+        }
+        list.innerHTML = '';
+        if (data.length === 0) {
+          list.innerHTML = '<div style="padding:12px;color:#888;">No chats found yet. Retrying...</div>';
+          setTimeout(loadChats, 5000);
+          return;
+        }
+        data.forEach((chat) => {
+          const div = document.createElement('div');
+          div.className = 'chat';
+          div.textContent = chat.name + (chat.unreadCount ? ' (' + chat.unreadCount + ')' : '');
+          div.onclick = () => loadMessages(chat.id, chat.name);
+          list.appendChild(div);
+        });
+      } catch (err) {
+        console.error('Chats fetch threw:', err);
+        list.innerHTML = '<div style="padding:12px;color:#c00;">Error loading chats: ' + err.message +
+          '<br><small>Retrying in 5s...</small></div>';
+        setTimeout(loadChats, 5000);
+      }
     }
 
     async function loadMessages(chatId, chatName) {
