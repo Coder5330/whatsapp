@@ -11,9 +11,9 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // Add/remove people here. `id` is used in URLs and as the session folder
 // name, so keep it simple (lowercase, no spaces).
 const USERS = [
-  { id: 'melissa', name: 'Melissa' },
+  { id: 'joshua', name: 'Joshua' },
   { id: 'friend2', name: 'Friend 2' }
-  // { id: 'friend3', name: 'Friend 3' },
+  { id: 'friend3', name: 'Friend 3' },
 ];
 
 // Chromium writes a SingletonLock (and related Singleton* files) into its
