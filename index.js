@@ -17,8 +17,8 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // on the volume that is already linked to a real WhatsApp account.
 const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
-  { id: 'Marshall', name: 'Marshall' },
-  { id: 'Yuanbin', name: 'Yuanbin' },
+  { id: 'marshall', name: 'Marshall' },
+  { id: 'yuanbin', name: 'Yuanbin' },
 ];
 
 // The live registry, loaded from the database at boot and appended to when
