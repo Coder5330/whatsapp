@@ -102,6 +102,20 @@ function buildClient(user, state) {
 
   const client = new Client({
     authStrategy: new LocalAuth({ dataPath: sessionPath }),
+    // Never replay a cached copy of WhatsApp Web.
+    //
+    // The default 'local' cache writes a snapshot of the page whenever
+    // injection fails, filed under the WhatsApp Web build the library was
+    // released against. Every later start then finds that file, intercepts
+    // the request to web.whatsapp.com, and serves the snapshot instead of
+    // the live page — so one failed start pins the app to a frozen copy of
+    // WhatsApp Web for good. A phone will refuse to link against a stale
+    // build ("can't link new devices right now") even though the same
+    // account links fine in a real browser.
+    //
+    // 'none' resolves to no cached content, which leaves the real request
+    // alone and loads whatever WhatsApp is serving today.
+    webVersionCache: { type: 'none' },
     puppeteer: {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
@@ -164,6 +178,18 @@ function buildClient(user, state) {
       state.isReady = true;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Store settle period complete.`);
+      // Which WhatsApp Web build we actually ended up on, and on what
+      // browser — the two things worth knowing when linking misbehaves.
+      Promise.all([
+        client.getWWebVersion().catch(() => 'unknown'),
+        client.pupBrowser && client.pupBrowser.version
+          ? client.pupBrowser.version().catch(() => 'unknown')
+          : Promise.resolve('unknown')
+      ])
+        .then(([web, browser]) => {
+          console.log(`[${user.id}] WhatsApp Web build ${web} via ${browser}`);
+        })
+        .catch(() => {});
     }, 8000);
   });
 

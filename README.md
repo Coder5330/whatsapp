@@ -224,6 +224,17 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
   service restarts and isn't shared across replicas.
 - There is no password reset by email — recovery is `npm run reset-inbox`,
   which needs access to the deployment.
+- The WhatsApp Web page is never cached. `whatsapp-web.js` defaults to a
+  `local` cache that snapshots the page whenever its injection step fails,
+  files it under the WhatsApp Web build the library was released against,
+  and then serves that snapshot on every later start instead of the live
+  page. One failed start therefore pins the app to a frozen copy of
+  WhatsApp Web, and a phone refuses to link against a stale build — "can't
+  link new devices right now" — even while the same account links fine in a
+  real browser. `webVersionCache: { type: 'none' }` keeps it on the live
+  page. Each inbox logs the build and browser it ended up on
+  (`WhatsApp Web build ... via ...`), which is the first thing to check if
+  linking misbehaves.
 - If the WhatsApp Web protocol changes, `whatsapp-web.js` sometimes needs a
   library update to keep working — keep an eye on its GitHub releases/issues
   if things break again.
