@@ -80,24 +80,64 @@ password immediately signs out anything using the old one. Failed attempts
 are throttled per inbox and per IP: 8 wrong guesses in 15 minutes locks that
 pair out for 15 minutes.
 
-## Adding / removing people
+## Adding people
 
-Edit the `USERS` array near the top of `index.js`:
+Use the **Add an inbox** form on the home page. Type a name, and you go
+straight to a QR code — scan it with WhatsApp, and the setup code appears so
+you can choose your own password. Nothing to edit, no redeploy.
 
-```js
-const USERS = [
-  { id: 'melissa', name: 'Melissa' },
-  { id: 'friend2', name: 'Friend 2' },
-];
-```
+**Four inboxes at once, maximum.** Each one runs its own headless Chromium
+(roughly 150–300MB), so the cap is a memory ceiling as much as a policy. To
+change it, edit `MAX_INBOXES` in `db.js`.
 
-`id` is used in URLs and as the session folder name — keep it lowercase,
-no spaces. Each person gets their own:
+The name becomes a URL slug — "Dan Lee" becomes `dan-lee` — used for:
 - QR page: `/<id>/qr`
 - Viewer page: `/<id>`
 - Session folder on disk: `<SESSION_PATH>/<id>/`
 
-Restart the service after editing the list.
+The two people who were hardcoded before (`joshua`, `Marshall`) are inserted
+into the database on first boot with their original ids, so their existing
+linked sessions keep working.
+
+### Locking down who can add one
+
+By default anyone who can reach the home page can create an inbox, up to the
+cap. Set `INVITE_CODE` to require a shared secret in the form as well:
+
+```bash
+INVITE_CODE='something-only-your-friends-know'
+```
+
+Worth doing on a public URL — a stranger cannot read anyone's messages, but
+they can burn a slot and start a Chromium instance on your server.
+
+### Removing one
+
+There is no delete button. Remove the rows by hand:
+
+```sql
+DELETE FROM inboxes WHERE id = 'dan-lee';
+DELETE FROM inbox_credentials WHERE user_id = 'dan-lee';
+```
+
+Then restart, and delete `<SESSION_PATH>/dan-lee/` to unlink the session.
+
+## Media
+
+Photos, videos, voice notes and stickers render inline in the conversation;
+documents appear as a download link. Media is fetched one message at a time
+from `/api/<id>/messages/<message-id>/media`, so a chat full of photos still
+opens immediately and the images stream in behind it. Recently viewed media
+is cached in memory (40 items / 64MB) so scrolling back does not re-download
+it.
+
+Only images, video and audio are served inline. Anything else — a document,
+an `.html` attachment — is sent as a download with
+`Content-Type: application/octet-stream`, so a booby-trapped attachment
+cannot run as a page on this origin.
+
+WhatsApp drops media from its servers after a while, so older messages may
+show "Photo unavailable" where the file is simply gone.
 
 ## Run locally
 
@@ -143,8 +183,9 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
   simultaneously — this uses meaningfully more RAM per person (roughly
   150–300MB each). Keep an eye on Railway's memory graph as you add people;
   you may need to bump the service's plan/resources.
-- Only text message bodies are shown — media (images, voice notes, etc.)
-  isn't downloaded or rendered in this minimal version.
+- Media is downloaded on demand through the server, so opening a chat full
+  of large photos uses bandwidth and memory on the service, not just in the
+  browser.
 - `fetchMessages` pulls up to 100 recent messages per chat on open; older
   history depends on what WhatsApp Web itself has synced.
 - Whoever runs the service can still read everything: they control the

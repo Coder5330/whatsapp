@@ -10,13 +10,41 @@ const views = require('./views');
 const PORT = process.env.PORT || 3000;
 const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 
-// ---- Hardcoded users ----
-// Add/remove people here. `id` is used in URLs and as the session folder
-// name, so keep it simple (lowercase, no spaces).
-const USERS = [
+// ---- Inboxes ----
+// The people who existed before inboxes were stored in the database. They
+// are inserted on first boot and then live in the `inboxes` table like any
+// other; their ids must not change, because each one names a session folder
+// on the volume that is already linked to a real WhatsApp account.
+const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
   { id: 'Marshall', name: 'Marshall' },
 ];
+
+// The live registry, loaded from the database at boot and appended to when
+// someone creates an inbox. `id` is used in URLs and as the session folder
+// name, so it is always a slug (see slugify below).
+let USERS = [];
+
+function findUser(id) {
+  return USERS.find((u) => u.id === id) || null;
+}
+
+// Ids end up as path segments and as directory names under SESSION_PATH, so
+// they are restricted to a plain slug — no dots, no slashes, nothing that
+// could climb out of the sessions directory.
+function slugify(name) {
+  return String(name)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32);
+}
+
+function isSafeInboxId(id) {
+  return typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id);
+}
 
 // Chromium writes a SingletonLock (and related Singleton* files) into its
 // profile directory while running. If the container is killed or crashes
@@ -128,7 +156,7 @@ function createSessionForUser(user) {
 }
 
 function getUserOr404(req, res) {
-  const user = USERS.find((u) => u.id === req.params.userId);
+  const user = findUser(req.params.userId);
   if (!user) {
     res.status(404).json({ error: 'Unknown user' });
     return null;
@@ -181,10 +209,10 @@ app.get('/favicon.ico', (req, res) => res.redirect(301, '/assets/icon.svg'));
 // trouble locks the inbox rather than letting the request through: the
 // credential store *is* the gate, so "cannot check" must mean "no".
 async function resolveInbox(req, res, { json = false } = {}) {
-  const user = USERS.find((u) => u.id === req.params.userId);
+  const user = findUser(req.params.userId);
   if (!user) {
     if (json) res.status(404).json({ error: 'Unknown user' });
-    else res.status(404).send(views.homePage(USERS.map((u) => ({ user: u, claimed: false }))));
+    else res.redirect('/');
     return null;
   }
 
@@ -250,15 +278,83 @@ function visibleClaimCode(state) {
 
 // ---- Public routes ----
 
+// ---- Creating an inbox ----
+// Open by default, which is what makes the button a button. Set INVITE_CODE
+// to require a shared secret first: each inbox costs a headless Chromium, so
+// an open form on a public URL is a resource risk as well as a tidiness one.
+const INVITE_CODE = process.env.INVITE_CODE || '';
+
 app.get('/', async (req, res) => {
   if (!db.isConfigured) return res.status(503).send(views.dbErrorPage({ configured: false }));
   try {
     const entries = await Promise.all(
       USERS.map(async (user) => ({ user, claimed: await db.isClaimed(user.id) }))
     );
-    res.send(views.homePage(entries));
+    res.send(
+      views.homePage(entries, {
+        max: db.MAX_INBOXES,
+        used: USERS.length,
+        needsInvite: INVITE_CODE.length > 0,
+        error: typeof req.query.error === 'string' ? req.query.error : ''
+      })
+    );
   } catch (err) {
     console.error('Home page credential lookup failed:', err.message);
+    res.status(503).send(views.dbErrorPage({ configured: true }));
+  }
+});
+
+app.post('/create', async (req, res) => {
+  if (!db.isConfigured) return res.status(503).send(views.dbErrorPage({ configured: false }));
+
+  const fail = (msg) => res.redirect('/?error=' + encodeURIComponent(msg));
+  const body = req.body || {};
+  const rawName = typeof body.name === 'string' ? body.name.trim() : '';
+
+  if (INVITE_CODE) {
+    const supplied = typeof body.invite === 'string' ? body.invite : '';
+    // Same throttle bucket as a login, keyed to a name no inbox can take.
+    if (auth.lockoutRemainingMs(req, ':create') > 0) {
+      return fail('Too many attempts. Try again in a few minutes.');
+    }
+    if (supplied !== INVITE_CODE) {
+      auth.recordFailure(req, ':create');
+      return fail('That invite code is not right.');
+    }
+    auth.clearFailures(req, ':create');
+  }
+
+  if (!rawName) return fail('Give the new inbox a name.');
+  if (rawName.length > 40) return fail('That name is too long.');
+
+  const id = slugify(rawName);
+  if (!isSafeInboxId(id)) {
+    return fail('Use a name with some letters or numbers in it.');
+  }
+
+  try {
+    if (USERS.length >= db.MAX_INBOXES) {
+      return fail(`There is room for ${db.MAX_INBOXES} inboxes and they are all taken.`);
+    }
+    if (await db.inboxExists(id)) {
+      return fail(`An inbox called "${id}" already exists.`);
+    }
+
+    const created = await db.createInbox(id, rawName);
+    if (!created) {
+      return fail('Could not create that inbox — the limit may have just been reached.');
+    }
+
+    const user = { id, name: rawName };
+    USERS.push(user);
+    sessions.set(id, createSessionForUser(user));
+    console.log(`Created inbox "${id}" (${USERS.length}/${db.MAX_INBOXES} used).`);
+
+    // Straight to the QR page: linking WhatsApp is what issues the setup
+    // code, and the setup code is what lets them set a password.
+    res.redirect(`/${encodeURIComponent(id)}/qr`);
+  } catch (err) {
+    console.error('Inbox creation failed:', err.message);
     res.status(503).send(views.dbErrorPage({ configured: true }));
   }
 });
@@ -315,7 +411,7 @@ app.post('/:userId/login', async (req, res) => {
 });
 
 app.post('/:userId/logout', async (req, res) => {
-  const user = USERS.find((u) => u.id === req.params.userId);
+  const user = findUser(req.params.userId);
   if (!user) return res.status(404).send('Unknown user');
   auth.clearSessionCookie(req, res, user.id);
   res.redirect(`/${encodeURIComponent(user.id)}/login`);
@@ -517,7 +613,12 @@ app.get('/api/:userId/chats', async (req, res) => {
           isGroup: c.isGroup,
           unreadCount: c.unreadCount,
           lastMessage: c.lastMessage
-            ? { body: c.lastMessage.body, timestamp: c.lastMessage.timestamp * 1000 }
+            ? {
+                body: c.lastMessage.body,
+                timestamp: c.lastMessage.timestamp * 1000,
+                hasMedia: !!c.lastMessage.hasMedia,
+                mediaKind: mediaKindOf(c.lastMessage)
+              }
             : null
         }))
       );
@@ -529,6 +630,111 @@ app.get('/api/:userId/chats', async (req, res) => {
     }
   }
   res.status(500).json({ error: 'Chat store not ready yet — WhatsApp may still be syncing. Try again shortly.' });
+});
+
+// ---- Media ----
+
+// whatsapp-web.js reports a message type per WhatsApp's own vocabulary;
+// collapse it to the handful of shapes the viewer knows how to render.
+function mediaKindOf(msg) {
+  if (!msg.hasMedia) return null;
+  switch (msg.type) {
+    case 'image':
+      return 'image';
+    case 'sticker':
+      return 'sticker';
+    case 'video':
+      return 'video';
+    case 'audio':
+      return 'audio';
+    case 'ptt':
+      return 'voice';
+    case 'document':
+      return 'document';
+    default:
+      return 'file';
+  }
+}
+
+// Downloading is slow enough that a re-render must not re-fetch, but media
+// is large, so the cache is bounded by both count and total bytes and drops
+// the oldest entry first.
+const MEDIA_CACHE_MAX_ITEMS = 40;
+const MEDIA_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const mediaCache = new Map();
+let mediaCacheBytes = 0;
+
+function cacheGet(key) {
+  const hit = mediaCache.get(key);
+  if (!hit) return null;
+  // Refresh recency.
+  mediaCache.delete(key);
+  mediaCache.set(key, hit);
+  return hit;
+}
+
+function cachePut(key, entry) {
+  if (entry.buffer.length > MEDIA_CACHE_MAX_BYTES) return;
+  mediaCache.set(key, entry);
+  mediaCacheBytes += entry.buffer.length;
+  while (mediaCache.size > MEDIA_CACHE_MAX_ITEMS || mediaCacheBytes > MEDIA_CACHE_MAX_BYTES) {
+    const oldestKey = mediaCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = mediaCache.get(oldestKey);
+    mediaCache.delete(oldestKey);
+    mediaCacheBytes -= oldest ? oldest.buffer.length : 0;
+  }
+}
+
+// Only these render inline. Everything else is sent as a download, because
+// serving arbitrary attachment types inline from this origin would let a
+// booby-trapped document (an .html or .svg with a script in it) run as if
+// the viewer had written it.
+const INLINE_MIME = /^(image\/(png|jpeg|gif|webp|bmp)|video\/(mp4|webm|ogg|quicktime)|audio\/(mpeg|mp4|ogg|wav|webm|aac|amr))$/i;
+
+app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+  const state = sessions.get(user.id);
+
+  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
+
+  const cacheKey = user.id + '|' + req.params.messageId;
+  let entry = cacheGet(cacheKey);
+
+  if (!entry) {
+    try {
+      const msg = await state.client.getMessageById(req.params.messageId);
+      if (!msg) return res.status(404).json({ error: 'Message not found' });
+      if (!msg.hasMedia) return res.status(404).json({ error: 'Message has no media' });
+
+      const media = await msg.downloadMedia();
+      // WhatsApp drops media from its servers after a while; an old message
+      // can legitimately have nothing left to download.
+      if (!media || !media.data) {
+        return res.status(410).json({ error: 'Media is no longer available' });
+      }
+
+      entry = {
+        buffer: Buffer.from(media.data, 'base64'),
+        mimetype: media.mimetype || 'application/octet-stream',
+        filename: media.filename || null
+      };
+      cachePut(cacheKey, entry);
+    } catch (err) {
+      console.error(`[${user.id}] media download failed:`, err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'Could not download that media' });
+    }
+  }
+
+  const inline = INLINE_MIME.test(entry.mimetype);
+  const safeName = (entry.filename || 'attachment').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Cache-Control', 'private, max-age=3600');
+  res.type(inline ? entry.mimetype : 'application/octet-stream');
+  res.set('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
+  res.send(entry.buffer);
 });
 
 app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
@@ -547,8 +753,11 @@ app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
           id: msg.id._serialized,
           fromMe: msg.fromMe,
           fromName: msg.fromMe ? 'You' : (contact.pushname || contact.number || 'Unknown'),
+          // For a media message this is the caption, which is often empty.
           body: msg.body,
-          timestamp: msg.timestamp * 1000
+          timestamp: msg.timestamp * 1000,
+          hasMedia: !!msg.hasMedia,
+          mediaKind: mediaKindOf(msg)
         };
       })
     );
@@ -577,16 +786,31 @@ async function start() {
   if (db.isConfigured) {
     try {
       await db.init();
+      await db.seedInboxes(SEED_USERS);
+      USERS = await db.listInboxes();
       console.log('Credential store ready.');
     } catch (err) {
       console.error('Could not reach the credential store:', err.message);
       console.error('Inboxes stay locked until DATABASE_URL points at a reachable Postgres.');
+      // Fall back to the seed list so the already-linked sessions still come
+      // up; every request will refuse to serve them until the store is back.
+      USERS = SEED_USERS.slice();
     }
   } else {
     console.warn(
-      'DATABASE_URL is not set. Inbox passwords live in Postgres (Neon), so every ' +
-        'inbox stays locked until it is configured.'
+      'DATABASE_URL is not set. Inboxes and their passwords live in Postgres ' +
+        '(Neon), so everything stays locked until it is configured.'
     );
+    USERS = SEED_USERS.slice();
+  }
+
+  // Ignore anything in the registry whose id could escape the sessions
+  // directory. Ids are slugs on the way in, so this only fires if a row was
+  // edited by hand.
+  const unsafe = USERS.filter((u) => !isSafeInboxId(u.id) && !SEED_USERS.some((s) => s.id === u.id));
+  if (unsafe.length) {
+    console.error('Ignoring inboxes with unsafe ids:', unsafe.map((u) => u.id).join(', '));
+    USERS = USERS.filter((u) => !unsafe.includes(u));
   }
 
   for (const user of USERS) {
@@ -595,7 +819,11 @@ async function start() {
 
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
-    console.log('Inboxes configured:', USERS.map((u) => u.id).join(', '));
+    console.log(
+      `Inboxes (${USERS.length}/${db.MAX_INBOXES}):`,
+      USERS.map((u) => u.id).join(', ') || '(none yet)'
+    );
+    if (INVITE_CODE) console.log('New inboxes require the invite code.');
   });
 }
 

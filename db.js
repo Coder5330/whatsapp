@@ -43,6 +43,10 @@ function getPool() {
   return pool;
 }
 
+// How many inboxes may exist at once. Each one runs its own headless
+// Chromium, so this is a memory ceiling as much as a policy.
+const MAX_INBOXES = 4;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS inbox_credentials (
   user_id         TEXT PRIMARY KEY,
@@ -51,6 +55,12 @@ CREATE TABLE IF NOT EXISTS inbox_credentials (
   claimed_at      TIMESTAMPTZ,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS inboxes (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 `;
 
@@ -136,13 +146,64 @@ async function resetInbox(userId) {
   );
 }
 
+// ---- The inbox registry ----
+
+async function listInboxes() {
+  const { rows } = await getPool().query(
+    'SELECT id, name FROM inboxes ORDER BY created_at, id'
+  );
+  return rows.map((r) => ({ id: r.id, name: r.name }));
+}
+
+async function countInboxes() {
+  const { rows } = await getPool().query('SELECT count(*)::int AS n FROM inboxes');
+  return rows[0].n;
+}
+
+async function inboxExists(id) {
+  const { rows } = await getPool().query('SELECT 1 FROM inboxes WHERE id = $1', [id]);
+  return rows.length > 0;
+}
+
+// The cap is enforced inside the statement rather than by a read-then-write,
+// so two people creating an inbox at the same moment cannot both slip past
+// the limit. Returns false when the cap is full or the id is taken.
+async function createInbox(id, name) {
+  const { rowCount } = await getPool().query(
+    `INSERT INTO inboxes (id, name)
+     SELECT $1, $2
+      WHERE (SELECT count(*) FROM inboxes) < $3
+     ON CONFLICT (id) DO NOTHING`,
+    [id, name, MAX_INBOXES]
+  );
+  return rowCount > 0;
+}
+
+// Carry the previously hardcoded people into the registry on first boot,
+// keeping their ids so their existing session folders still match.
+async function seedInboxes(users) {
+  for (const user of users) {
+    await getPool().query(
+      `INSERT INTO inboxes (id, name) VALUES ($1, $2)
+       ON CONFLICT (id) DO NOTHING`,
+      [user.id, user.name]
+    );
+  }
+}
+
 async function close() {
   if (pool) await pool.end();
 }
 
 module.exports = {
+  MAX_INBOXES,
   isConfigured,
   init,
+  listInboxes,
+  countInboxes,
+  inboxExists,
+  createInbox,
+  seedInboxes,
   getCredential,
   isClaimed,
   storeClaimCode,

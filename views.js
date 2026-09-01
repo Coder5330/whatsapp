@@ -207,6 +207,20 @@ code {
 .user-card .state { font-size: 13px; color: var(--muted); }
 .user-card .grow { flex: 1; min-width: 0; }
 
+.create-card {
+  margin-top: 22px;
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.create-card h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+
+.create-form { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.create-form input { flex: 1; min-width: 180px; margin-top: 0; }
+.create-form button { flex-shrink: 0; }
+
 .qr-link {
   font-size: 13px;
   font-weight: 500;
@@ -500,6 +514,47 @@ body.viewer { height: 100vh; overflow: hidden; }
 .bubble .text { white-space: pre-wrap; }
 .bubble .text.media { color: var(--muted); font-style: italic; }
 
+.media-wrap { margin: 2px 0 4px; }
+
+.media-img {
+  display: block;
+  max-width: 100%;
+  max-height: 340px;
+  width: auto;
+  border-radius: 8px;
+  background: var(--panel-alt);
+}
+
+.media-img.sticker {
+  max-height: 140px;
+  background: none;
+}
+
+.media-audio { width: 100%; min-width: 240px; max-width: 320px; display: block; }
+
+.media-file {
+  display: inline-block;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  text-decoration: none;
+}
+
+.media-file:hover { border-color: var(--accent); }
+
+.media-fallback {
+  font-size: 13px;
+  font-style: italic;
+  color: var(--muted);
+  background: var(--panel-alt);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
 .bubble .time {
   font-size: 11px;
   color: var(--muted);
@@ -721,8 +776,8 @@ function dbErrorPage({ configured }) {
   });
 }
 
-// entries: [{ user, claimed }]
-function homePage(entries) {
+// entries: [{ user, claimed }]; capacity: { max, used, needsInvite, error }
+function homePage(entries, capacity = { max: 0, used: 0, needsInvite: false, error: '' }) {
   const cards = entries
     .map(({ user, claimed }) => {
       const id = encodeURIComponent(user.id);
@@ -745,6 +800,9 @@ function homePage(entries) {
     })
     .join('');
 
+  const slotsLeft = Math.max(0, capacity.max - capacity.used);
+  const full = slotsLeft === 0;
+
   return page({
     title: 'WhatsApp Viewer',
     body: `
@@ -755,8 +813,42 @@ function homePage(entries) {
       <h1>WhatsApp Viewer</h1>
       <p>Each inbox has its own password, set by its owner.</p>
     </div>
+    <div class="spacer"></div>
+    <span class="pill">${capacity.used} of ${capacity.max} used</span>
   </header>
+
+  ${capacity.error ? `<div class="alert">${escapeHtml(capacity.error)}</div>` : ''}
+
   <div class="user-grid">${cards}</div>
+
+  <div class="create-card">
+    ${
+      full
+        ? `<h2>All ${capacity.max} inboxes are in use</h2>
+           <p class="hint">
+             There is room for ${capacity.max} at once, since each one runs its
+             own copy of WhatsApp on the server.
+           </p>`
+        : `<h2>Add an inbox</h2>
+           <p class="hint" style="margin-top:0;">
+             ${slotsLeft} slot${slotsLeft === 1 ? '' : 's'} left. You will be
+             taken straight to a QR code to link WhatsApp, then you choose
+             your own password.
+           </p>
+           <form class="create-form" method="POST" action="/create">
+             <input type="text" name="name" placeholder="Name, e.g. Priya"
+                    maxlength="40" required aria-label="Name for the new inbox" />
+             ${
+               capacity.needsInvite
+                 ? `<input type="text" name="invite" placeholder="Invite code"
+                           autocomplete="off" required aria-label="Invite code" />`
+                 : ''
+             }
+             <button type="submit">Create inbox</button>
+           </form>`
+    }
+  </div>
+
   <p class="hint" style="margin-top:22px;">
     Signing in to one inbox gives you access to that inbox only.
   </p>
@@ -1035,7 +1127,9 @@ function viewerPage(user) {
       var preview = document.createElement('div');
       preview.className = 'preview';
       preview.textContent = chat.lastMessage
-        ? (chat.lastMessage.body || '[media]')
+        ? (chat.lastMessage.body ||
+           MEDIA_LABEL[chat.lastMessage.mediaKind] ||
+           (chat.lastMessage.hasMedia ? 'Attachment' : 'No text'))
         : 'No messages yet';
       grow.appendChild(preview);
       row.appendChild(grow);
@@ -1110,6 +1204,81 @@ function viewerPage(user) {
     }
   }
 
+  function mediaUrl(messageId) {
+    return '/api/' + encodeURIComponent(userId) + '/messages/' +
+      encodeURIComponent(messageId) + '/media';
+  }
+
+  var MEDIA_LABEL = {
+    image: 'Photo', sticker: 'Sticker', video: 'Video',
+    audio: 'Audio', voice: 'Voice message', document: 'Document', file: 'Attachment'
+  };
+
+  // Media is fetched per message rather than inlined into the chat payload,
+  // so a chat full of photos still opens immediately and the images stream
+  // in behind it.
+  function buildMedia(m) {
+    var wrap = document.createElement('div');
+    wrap.className = 'media-wrap';
+    var url = mediaUrl(m.id);
+
+    function failed(note) {
+      var f = document.createElement('div');
+      f.className = 'media-fallback';
+      f.textContent = note;
+      wrap.innerHTML = '';
+      wrap.appendChild(f);
+    }
+
+    if (m.mediaKind === 'image' || m.mediaKind === 'sticker') {
+      var link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      var img = document.createElement('img');
+      img.className = 'media-img' + (m.mediaKind === 'sticker' ? ' sticker' : '');
+      img.loading = 'lazy';
+      img.alt = MEDIA_LABEL[m.mediaKind];
+      img.addEventListener('error', function () { failed(MEDIA_LABEL[m.mediaKind] + ' unavailable'); });
+      img.src = url;
+      link.appendChild(img);
+      wrap.appendChild(link);
+      return wrap;
+    }
+
+    if (m.mediaKind === 'video') {
+      var video = document.createElement('video');
+      video.className = 'media-img';
+      video.controls = true;
+      video.preload = 'metadata';
+      video.addEventListener('error', function () { failed('Video unavailable'); });
+      video.src = url;
+      wrap.appendChild(video);
+      return wrap;
+    }
+
+    if (m.mediaKind === 'audio' || m.mediaKind === 'voice') {
+      var audio = document.createElement('audio');
+      audio.className = 'media-audio';
+      audio.controls = true;
+      audio.preload = 'metadata';
+      audio.addEventListener('error', function () { failed('Audio unavailable'); });
+      audio.src = url;
+      wrap.appendChild(audio);
+      return wrap;
+    }
+
+    // Documents and anything unrecognised are offered as a download rather
+    // than rendered, since the server refuses to serve them inline.
+    var dl = document.createElement('a');
+    dl.className = 'media-file';
+    dl.href = url;
+    dl.setAttribute('download', '');
+    dl.textContent = '\u2193 ' + (MEDIA_LABEL[m.mediaKind] || 'Attachment');
+    wrap.appendChild(dl);
+    return wrap;
+  }
+
   function renderMessages(msgs, chat) {
     messagesEl.innerHTML = '';
     if (msgs.length === 0) {
@@ -1147,11 +1316,19 @@ function viewerPage(user) {
       }
       lastSender = m.fromName;
 
-      var text = document.createElement('div');
-      text.className = 'text' + (m.body ? '' : ' media');
-      // textContent, never innerHTML: message bodies are untrusted input.
-      text.textContent = m.body || '[media / no text]';
-      bubble.appendChild(text);
+      if (m.hasMedia) {
+        bubble.appendChild(buildMedia(m));
+      }
+
+      // A media message's body is its caption, and captions are often
+      // empty — only add a text row when there is something to show.
+      if (m.body || !m.hasMedia) {
+        var text = document.createElement('div');
+        text.className = 'text' + (m.body ? '' : ' media');
+        // textContent, never innerHTML: message bodies are untrusted input.
+        text.textContent = m.body || '[no text]';
+        bubble.appendChild(text);
+      }
 
       var time = document.createElement('div');
       time.className = 'time';
