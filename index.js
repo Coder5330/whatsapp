@@ -1176,6 +1176,32 @@ function renameSessionDir(from, to) {
 // Launching every Chromium at once is what starves them into timing out.
 const STARTUP_STAGGER_MS = 8000;
 
+// Comma-separated inbox ids (or "all") whose stored WhatsApp session should
+// be set aside at boot, so they start from a clean QR code. Needed when a
+// session is dead but the app cannot tell — after unpairing the device from
+// the phone, say — because there is otherwise no way to clear one without
+// shell access to the volume. Set it, deploy once, then remove it.
+const RESET_SESSIONS = (process.env.RESET_SESSIONS || '')
+  .split(',')
+  .map((v) => v.trim().toLowerCase())
+  .filter(Boolean);
+
+function applySessionResets(users) {
+  if (RESET_SESSIONS.length === 0) return;
+  const all = RESET_SESSIONS.includes('all');
+
+  for (const user of users) {
+    if (!all && !RESET_SESSIONS.includes(user.id.toLowerCase())) continue;
+    if (!fs.existsSync(path.join(SESSION_ROOT, user.id))) {
+      console.log(`[${user.id}] RESET_SESSIONS: nothing stored, already clean.`);
+      continue;
+    }
+    parkDeadSession(user.id);
+    console.log(`[${user.id}] RESET_SESSIONS: cleared — this inbox will show a fresh QR code.`);
+  }
+  console.log('RESET_SESSIONS applied. Remove the variable so it does not run again next deploy.');
+}
+
 // How many inboxes may run a browser at the same time. Each one costs a
 // headless Chromium, and on a container too small for all of them the
 // symptom is not a clean error: pages freeze, QR codes stop rotating, and
@@ -1224,6 +1250,8 @@ async function start() {
     );
     USERS = USERS.filter((u) => isSafeInboxId(u.id));
   }
+
+  applySessionResets(USERS);
 
   const activeLimit = MAX_ACTIVE_INBOXES > 0 ? MAX_ACTIVE_INBOXES : USERS.length;
 

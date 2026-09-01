@@ -51,6 +51,20 @@ re-link from the QR page and read the code straight off the screen. A new
 code is issued on every restart while an inbox is unclaimed, so the newest
 line in the logs is the valid one.
 
+### Clearing a dead WhatsApp session
+
+If an inbox's stored session can no longer work — the device was unpaired
+from the phone, or the session is stuck — set `RESET_SESSIONS` to the inbox
+ids to clear (or `all`), deploy once, then remove the variable:
+
+```bash
+RESET_SESSIONS=joshua,marshall
+```
+
+Those inboxes start from a fresh QR code. The old session is moved aside as
+`<id>.loggedout-<timestamp>` rather than deleted, and inbox passwords are
+untouched — this only clears the WhatsApp link, not the account.
+
 ### Forgotten passwords
 
 ```bash
