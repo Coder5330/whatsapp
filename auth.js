@@ -1,48 +1,207 @@
 const crypto = require('crypto');
 
-// ---- Configuration ----
-// The viewer is locked behind a single shared password, set via the
-// APP_PASSWORD environment variable. There is deliberately no default and
-// no way to skip it: if APP_PASSWORD is unset the app refuses to serve any
-// page rather than quietly falling open to the whole internet.
-const APP_PASSWORD = process.env.APP_PASSWORD || '';
-const isConfigured = APP_PASSWORD.length > 0;
+// Per-inbox authentication.
+//
+// Every person sets their own password for their own inbox. Nobody sets it
+// for them: the server issues a one-time claim code at the moment that
+// person links their WhatsApp by scanning the QR code, and only someone
+// holding that code can set the inbox's first password. Possession of the
+// phone that scanned is the proof of ownership.
 
-// Login cookies are signed with a key derived from the password itself
-// (unless SESSION_SECRET is set explicitly). Deriving it means sessions
-// survive restarts and redeploys, and changing APP_PASSWORD automatically
-// invalidates every cookie that was issued under the old one.
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  (isConfigured
-    ? crypto.createHash('sha256').update('wa-viewer/v1:' + APP_PASSWORD).digest('hex')
-    : '');
-
-const COOKIE_NAME = 'wa_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-// ---- Brute-force throttling ----
-// Small in-memory tally per client IP. Not distributed and not persistent —
-// it resets on restart — but enough to make guessing a shared password over
-// the network impractical.
+// ---- Password / claim-code hashing (scrypt) ----
+
+const SCRYPT_N = 16384;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const KEY_LEN = 32;
+
+function hashSecret(plain) {
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(plain, salt, KEY_LEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P });
+  return ['scrypt', SCRYPT_N, SCRYPT_R, SCRYPT_P, salt.toString('hex'), key.toString('hex')].join('$');
+}
+
+function verifySecret(plain, stored) {
+  if (typeof plain !== 'string' || typeof stored !== 'string' || !stored) return false;
+  const parts = stored.split('$');
+  if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
+
+  const [, n, r, p, saltHex, keyHex] = parts;
+  let candidate;
+  try {
+    candidate = crypto.scryptSync(plain, Buffer.from(saltHex, 'hex'), keyHex.length / 2, {
+      N: Number(n),
+      r: Number(r),
+      p: Number(p)
+    });
+  } catch {
+    return false;
+  }
+  const expected = Buffer.from(keyHex, 'hex');
+  if (candidate.length !== expected.length) return false;
+  return crypto.timingSafeEqual(candidate, expected);
+}
+
+// ---- Claim codes ----
+
+// Crockford-ish alphabet: no O/0, I/1, U. These get read aloud and retyped
+// by hand, so the ambiguous characters are worth losing.
+const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTVWXYZ';
+
+function generateClaimCode() {
+  const bytes = crypto.randomBytes(8);
+  let out = '';
+  for (let i = 0; i < 8; i++) {
+    out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+    if (i === 3) out += '-';
+  }
+  return out;
+}
+
+// Accept the code however it comes back: lowercase, spaces, missing dash.
+function normalizeClaimCode(value) {
+  if (typeof value !== 'string') return '';
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function hashClaimCode(code) {
+  return hashSecret(normalizeClaimCode(code));
+}
+
+function claimCodeMatches(candidate, storedHash) {
+  return verifySecret(normalizeClaimCode(candidate), storedHash);
+}
+
+// ---- Password rules ----
+
+const MIN_PASSWORD_LENGTH = 8;
+
+function passwordProblem(password, confirm) {
+  if (typeof password !== 'string' || password.length === 0) return 'Choose a password.';
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return 'Use at least ' + MIN_PASSWORD_LENGTH + ' characters.';
+  }
+  if (password.length > 200) return 'That password is too long.';
+  if (confirm !== undefined && password !== confirm) return 'The two passwords do not match.';
+  return null;
+}
+
+// ---- Session cookies ----
+
+// One cookie per inbox, so signing in as Joshua grants nothing on
+// Marshall's inbox. The id is sanitised for the cookie name and a short
+// digest appended so two ids cannot collide onto one cookie.
+function cookieNameFor(userId) {
+  const safe = String(userId).replace(/[^A-Za-z0-9_-]/g, '_');
+  const digest = crypto.createHash('sha256').update(String(userId)).digest('hex').slice(0, 8);
+  return 'wa_s_' + safe + '_' + digest;
+}
+
+// The signing key is derived from the stored password hash, so changing a
+// password invalidates that person's existing cookies for free.
+// SESSION_SECRET is optional: the password hash is already server-side-only
+// and unguessable.
+function keyFor(userId, passwordHash) {
+  return crypto
+    .createHmac('sha256', process.env.SESSION_SECRET || 'wa-viewer/per-inbox/v1')
+    .update(String(userId) + ' ' + String(passwordHash))
+    .digest();
+}
+
+function issueToken(userId, passwordHash) {
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const sig = crypto
+    .createHmac('sha256', keyFor(userId, passwordHash))
+    .update(String(expiresAt))
+    .digest('hex');
+  return expiresAt + '.' + sig;
+}
+
+function tokenIsValid(token, userId, passwordHash) {
+  if (typeof token !== 'string' || !passwordHash) return false;
+  const dot = token.indexOf('.');
+  if (dot < 1) return false;
+
+  const expiresAt = Number(token.slice(0, dot));
+  const signature = token.slice(dot + 1);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
+
+  const expected = crypto
+    .createHmac('sha256', keyFor(userId, passwordHash))
+    .update(String(expiresAt))
+    .digest('hex');
+  if (signature.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const name = part.slice(0, eq).trim();
+    if (!name) continue;
+    const raw = part.slice(eq + 1).trim();
+    try {
+      out[name] = decodeURIComponent(raw);
+    } catch {
+      out[name] = raw;
+    }
+  }
+  return out;
+}
+
+function isSecureRequest(req) {
+  return req.secure || req.headers['x-forwarded-proto'] === 'https';
+}
+
+function isLoggedInAs(req, userId, passwordHash) {
+  return tokenIsValid(parseCookies(req)[cookieNameFor(userId)], userId, passwordHash);
+}
+
+function setSessionCookie(req, res, userId, passwordHash) {
+  res.cookie(cookieNameFor(userId), issueToken(userId, passwordHash), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isSecureRequest(req),
+    maxAge: SESSION_TTL_MS,
+    path: '/'
+  });
+}
+
+function clearSessionCookie(req, res, userId) {
+  res.clearCookie(cookieNameFor(userId), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isSecureRequest(req),
+    path: '/'
+  });
+}
+
+// ---- Brute-force throttling, per (IP, inbox) ----
+
 const MAX_ATTEMPTS = 8;
 const ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const attempts = new Map();
 
-function clientKey(req) {
-  return req.ip || req.connection?.remoteAddress || 'unknown';
+function attemptKey(req, userId) {
+  return (req.ip || 'unknown') + '|' + userId;
 }
 
-function lockoutRemainingMs(req) {
-  const entry = attempts.get(clientKey(req));
+function lockoutRemainingMs(req, userId) {
+  const entry = attempts.get(attemptKey(req, userId));
   if (!entry || !entry.lockedUntil) return 0;
   const remaining = entry.lockedUntil - Date.now();
   return remaining > 0 ? remaining : 0;
 }
 
-function recordFailure(req) {
-  const key = clientKey(req);
+function recordFailure(req, userId) {
+  const key = attemptKey(req, userId);
   const now = Date.now();
   const entry = attempts.get(key);
 
@@ -58,106 +217,32 @@ function recordFailure(req) {
   }
 }
 
-function clearFailures(req) {
-  attempts.delete(clientKey(req));
-}
-
-// ---- Password + cookie primitives ----
-
-// Compare via fixed-length digests so the comparison is constant time and
-// doesn't leak the password's length through timing.
-function passwordMatches(candidate) {
-  if (!isConfigured || typeof candidate !== 'string' || candidate.length === 0) return false;
-  const a = crypto.createHash('sha256').update(candidate).digest();
-  const b = crypto.createHash('sha256').update(APP_PASSWORD).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
-function sign(value) {
-  return crypto.createHmac('sha256', SESSION_SECRET).update(String(value)).digest('hex');
-}
-
-function issueToken() {
-  const expiresAt = Date.now() + SESSION_TTL_MS;
-  return expiresAt + '.' + sign(expiresAt);
-}
-
-function tokenIsValid(token) {
-  if (!isConfigured || typeof token !== 'string') return false;
-  const dot = token.indexOf('.');
-  if (dot < 1) return false;
-
-  const expiresAt = Number(token.slice(0, dot));
-  const signature = token.slice(dot + 1);
-  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
-
-  const expected = sign(expiresAt);
-  if (signature.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-}
-
-function parseCookies(req) {
-  const header = req.headers.cookie;
-  const out = {};
-  if (!header) return out;
-  for (const part of header.split(';')) {
-    const eq = part.indexOf('=');
-    if (eq < 0) continue;
-    const name = part.slice(0, eq).trim();
-    if (!name) continue;
-    try {
-      out[name] = decodeURIComponent(part.slice(eq + 1).trim());
-    } catch {
-      out[name] = part.slice(eq + 1).trim();
-    }
-  }
-  return out;
-}
-
-function isLoggedIn(req) {
-  return tokenIsValid(parseCookies(req)[COOKIE_NAME]);
-}
-
-function setSessionCookie(req, res) {
-  res.cookie(COOKIE_NAME, issueToken(), {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: isSecureRequest(req),
-    maxAge: SESSION_TTL_MS,
-    path: '/'
-  });
-}
-
-function clearSessionCookie(req, res) {
-  res.clearCookie(COOKIE_NAME, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: isSecureRequest(req),
-    path: '/'
-  });
-}
-
-function isSecureRequest(req) {
-  return req.secure || req.headers['x-forwarded-proto'] === 'https';
+function clearFailures(req, userId) {
+  attempts.delete(attemptKey(req, userId));
 }
 
 // Only allow redirects back to a path on this same site, so a crafted
-// ?next=... can't bounce someone to an attacker's page after login.
-function safeNextPath(value) {
-  if (typeof value !== 'string' || !value.startsWith('/')) return '/';
-  if (value.startsWith('//') || value.startsWith('/\\')) return '/';
+// ?next=... cannot bounce someone to an attacker's page after login.
+function safeNextPath(value, fallback = '/') {
+  if (typeof value !== 'string' || !value.startsWith('/')) return fallback;
+  if (value.startsWith('//') || value.charAt(1) === '\\') return fallback;
   return value;
 }
 
 module.exports = {
-  COOKIE_NAME,
-  isConfigured,
-  isLoggedIn,
-  passwordMatches,
+  MIN_PASSWORD_LENGTH,
+  hashSecret,
+  verifySecret,
+  generateClaimCode,
+  normalizeClaimCode,
+  hashClaimCode,
+  claimCodeMatches,
+  passwordProblem,
+  isLoggedInAs,
   setSessionCookie,
   clearSessionCookie,
-  safeNextPath,
   lockoutRemainingMs,
   recordFailure,
-  clearFailures
+  clearFailures,
+  safeNextPath
 };

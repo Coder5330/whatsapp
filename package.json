@@ -5,11 +5,13 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "reset-inbox": "node reset-inbox.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "github:carlosalaniz/whatsapp-web.js#fix/lid-getchats-crash",
+    "express": "^4.21.1",
+    "pg": "^8.13.1",
     "qrcode": "^1.5.4",
-    "express": "^4.21.1"
+    "whatsapp-web.js": "github:carlosalaniz/whatsapp-web.js#fix/lid-getchats-crash"
   }
 }

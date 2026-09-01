@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const auth = require('./auth');
+const db = require('./db');
 const views = require('./views');
 
 const PORT = process.env.PORT || 3000;
@@ -79,11 +80,18 @@ function createSessionForUser(user) {
     client,
     latestQr: null,
     isReady: false,
-    statusText: 'Starting up...'
+    statusText: 'Starting up...',
+    // Set once this process has actually displayed a QR code, which is how
+    // we know a later 'authenticated' came from someone scanning it here
+    // rather than from a session restored off the volume.
+    sawQrThisRun: false,
+    claimCodePlain: null,
+    codeVisibleUntil: 0
   };
 
   client.on('qr', async (qr) => {
     state.statusText = 'Scan the QR code below with WhatsApp on your phone.';
+    state.sawQrThisRun = true;
     state.latestQr = await qrcode.toDataURL(qr);
     console.log(`[${user.id}] QR code updated. Visit /${user.id}/qr to scan it.`);
   });
@@ -91,6 +99,10 @@ function createSessionForUser(user) {
   client.on('authenticated', () => {
     state.statusText = 'Authenticated. Finishing startup...';
     state.latestQr = null;
+    // Linking WhatsApp is what proves this inbox belongs to whoever is
+    // holding the phone, so that is the moment a setup code is worth
+    // issuing — but only while nobody has set a password yet.
+    issueClaimCodeIfNeeded(user, state);
   });
 
   client.on('ready', () => {
@@ -115,10 +127,6 @@ function createSessionForUser(user) {
   return state;
 }
 
-for (const user of USERS) {
-  sessions.set(user.id, createSessionForUser(user));
-}
-
 function getUserOr404(req, res) {
   const user = USERS.find((u) => u.id === req.params.userId);
   if (!user) {
@@ -141,6 +149,11 @@ async function shutdown(signal) {
       }
     })
   );
+  try {
+    await db.close();
+  } catch (err) {
+    console.warn('Error closing the credential pool:', err.message);
+  }
   process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -152,8 +165,8 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: false }));
 
-// The stylesheet holds no private data and is needed by the login page
-// itself, so it is served before the auth gate.
+// Assets carry no private data and the login page needs them, so they are
+// served ahead of any inbox check.
 app.get('/assets/app.css', (req, res) => {
   res.type('text/css').set('Cache-Control', 'public, max-age=3600').send(views.STYLES);
 });
@@ -164,71 +177,318 @@ app.get('/assets/icon.svg', (req, res) => {
 
 app.get('/favicon.ico', (req, res) => res.redirect(301, '/assets/icon.svg'));
 
-app.get('/login', (req, res) => {
-  if (!auth.isConfigured) return res.status(503).send(views.setupPage());
-  if (auth.isLoggedIn(req)) return res.redirect(auth.safeNextPath(req.query.next));
-  res.send(views.loginPage({ next: auth.safeNextPath(req.query.next) }));
+// Look up the inbox and its stored credential in one step. Any database
+// trouble locks the inbox rather than letting the request through: the
+// credential store *is* the gate, so "cannot check" must mean "no".
+async function resolveInbox(req, res, { json = false } = {}) {
+  const user = USERS.find((u) => u.id === req.params.userId);
+  if (!user) {
+    if (json) res.status(404).json({ error: 'Unknown user' });
+    else res.status(404).send(views.homePage(USERS.map((u) => ({ user: u, claimed: false }))));
+    return null;
+  }
+
+  if (!db.isConfigured) {
+    if (json) res.status(503).json({ error: 'DATABASE_URL is not configured' });
+    else res.status(503).send(views.dbErrorPage({ configured: false }));
+    return null;
+  }
+
+  try {
+    const cred = await db.getCredential(user.id);
+    return { user, cred, state: sessions.get(user.id) };
+  } catch (err) {
+    console.error(`[${user.id}] credential lookup failed:`, err.message);
+    if (json) res.status(503).json({ error: 'Credential store unavailable' });
+    else res.status(503).send(views.dbErrorPage({ configured: true }));
+    return null;
+  }
+}
+
+function isClaimed(cred) {
+  return !!(cred && cred.passwordHash);
+}
+
+// ---- Claim codes ----
+
+// Issued when a person links their WhatsApp. The plaintext is held only in
+// memory and only shown on the QR page when this process actually watched
+// the scan happen — for a session restored from disk the QR page is public
+// to anyone who has not claimed it yet, so the code goes to the logs alone.
+const CODE_VISIBLE_MS = 15 * 60 * 1000;
+
+async function issueClaimCodeIfNeeded(user, state) {
+  if (!db.isConfigured) return;
+  try {
+    if (await db.isClaimed(user.id)) return;
+
+    const code = auth.generateClaimCode();
+    const stored = await db.storeClaimCode(user.id, auth.hashClaimCode(code));
+    if (!stored) return; // claimed in the meantime
+
+    if (state.sawQrThisRun) {
+      state.claimCodePlain = code;
+      state.codeVisibleUntil = Date.now() + CODE_VISIBLE_MS;
+      console.log(`[${user.id}] Setup code issued and shown on the QR page.`);
+    } else {
+      state.claimCodePlain = null;
+      state.codeVisibleUntil = 0;
+    }
+    // Always log it: this is the only route to the code for a session that
+    // was restored from disk rather than scanned just now.
+    console.log(`[${user.id}] SETUP CODE: ${code} — give this to ${user.name} to set their password.`);
+  } catch (err) {
+    console.error(`[${user.id}] could not issue setup code:`, err.message);
+  }
+}
+
+function visibleClaimCode(state) {
+  if (!state.claimCodePlain) return null;
+  if (!state.codeVisibleUntil || Date.now() > state.codeVisibleUntil) return null;
+  return state.claimCodePlain;
+}
+
+// ---- Public routes ----
+
+app.get('/', async (req, res) => {
+  if (!db.isConfigured) return res.status(503).send(views.dbErrorPage({ configured: false }));
+  try {
+    const entries = await Promise.all(
+      USERS.map(async (user) => ({ user, claimed: await db.isClaimed(user.id) }))
+    );
+    res.send(views.homePage(entries));
+  } catch (err) {
+    console.error('Home page credential lookup failed:', err.message);
+    res.status(503).send(views.dbErrorPage({ configured: true }));
+  }
 });
 
-app.post('/login', (req, res) => {
-  if (!auth.isConfigured) return res.status(503).send(views.setupPage());
+app.get('/:userId/login', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
 
-  const next = auth.safeNextPath(req.body && req.body.next);
-  const lockedFor = auth.lockoutRemainingMs(req);
+  if (!isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/setup`);
+  if (auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(auth.safeNextPath(req.query.next, `/${encodeURIComponent(user.id)}`));
+  }
+  res.send(
+    views.inboxLoginPage({
+      user,
+      next: auth.safeNextPath(req.query.next, `/${encodeURIComponent(user.id)}`)
+    })
+  );
+});
+
+app.post('/:userId/login', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (!isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/setup`);
+
+  const next = auth.safeNextPath(req.body && req.body.next, `/${encodeURIComponent(user.id)}`);
+  const lockedFor = auth.lockoutRemainingMs(req, user.id);
 
   if (lockedFor > 0) {
     const minutes = Math.ceil(lockedFor / 60000);
     return res.status(429).send(
-      views.loginPage({
+      views.inboxLoginPage({
+        user,
         next,
         error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`
       })
     );
   }
 
-  if (!auth.passwordMatches(req.body && req.body.password)) {
-    auth.recordFailure(req);
-    console.warn(`Failed login attempt from ${req.ip}`);
-    return res.status(401).send(views.loginPage({ next, error: 'Incorrect password.' }));
+  if (!auth.verifySecret((req.body && req.body.password) || '', cred.passwordHash)) {
+    auth.recordFailure(req, user.id);
+    console.warn(`[${user.id}] Failed login attempt from ${req.ip}`);
+    return res
+      .status(401)
+      .send(views.inboxLoginPage({ user, next, error: 'Incorrect password.' }));
   }
 
-  auth.clearFailures(req);
-  auth.setSessionCookie(req, res);
+  auth.clearFailures(req, user.id);
+  auth.setSessionCookie(req, res, user.id, cred.passwordHash);
   res.redirect(next);
 });
 
-app.post('/logout', (req, res) => {
-  auth.clearSessionCookie(req, res);
-  res.redirect('/login');
+app.post('/:userId/logout', async (req, res) => {
+  const user = USERS.find((u) => u.id === req.params.userId);
+  if (!user) return res.status(404).send('Unknown user');
+  auth.clearSessionCookie(req, res, user.id);
+  res.redirect(`/${encodeURIComponent(user.id)}/login`);
 });
 
-// Everything below this line requires a valid session.
-app.use((req, res, next) => {
-  const wantsJson = req.path.startsWith('/api/');
+// ---- First-run setup: prove ownership with the code, then pick a password ----
 
-  if (!auth.isConfigured) {
-    return wantsJson
-      ? res.status(503).json({ error: 'APP_PASSWORD is not configured on the server' })
-      : res.status(503).send(views.setupPage());
+app.get('/:userId/setup', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/login`);
+  if (!cred || !cred.claimCodeHash) return res.send(views.inboxAwaitingCodePage({ user }));
+
+  const prefill = typeof req.query.code === 'string' ? req.query.code : '';
+  res.send(views.inboxSetupPage({ user, prefillCode: prefill }));
+});
+
+app.post('/:userId/setup', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred, state } = ctx;
+
+  if (isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/login`);
+  if (!cred || !cred.claimCodeHash) return res.send(views.inboxAwaitingCodePage({ user }));
+
+  const body = req.body || {};
+  const lockedFor = auth.lockoutRemainingMs(req, user.id);
+  if (lockedFor > 0) {
+    const minutes = Math.ceil(lockedFor / 60000);
+    return res.status(429).send(
+      views.inboxSetupPage({
+        user,
+        error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`
+      })
+    );
   }
-  if (auth.isLoggedIn(req)) return next();
 
-  if (wantsJson) return res.status(401).json({ error: 'Not authenticated' });
-  res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));
+  if (!auth.claimCodeMatches(body.code || '', cred.claimCodeHash)) {
+    auth.recordFailure(req, user.id);
+    console.warn(`[${user.id}] Bad setup code from ${req.ip}`);
+    return res
+      .status(401)
+      .send(views.inboxSetupPage({ user, error: 'That setup code is not right.' }));
+  }
+
+  const problem = auth.passwordProblem(body.password, body.confirm);
+  if (problem) {
+    return res.status(400).send(
+      views.inboxSetupPage({ user, prefillCode: body.code || '', error: problem })
+    );
+  }
+
+  const passwordHash = auth.hashSecret(body.password);
+  let claimed;
+  try {
+    claimed = await db.claimInbox(user.id, passwordHash);
+  } catch (err) {
+    console.error(`[${user.id}] claim failed:`, err.message);
+    return res.status(503).send(views.dbErrorPage({ configured: true }));
+  }
+
+  if (!claimed) {
+    // Someone else completed setup between the code check and the write.
+    return res.redirect(`/${encodeURIComponent(user.id)}/login`);
+  }
+
+  state.claimCodePlain = null;
+  state.codeVisibleUntil = 0;
+  auth.clearFailures(req, user.id);
+  auth.setSessionCookie(req, res, user.id, passwordHash);
+  console.log(`[${user.id}] Inbox claimed — password set by its owner.`);
+  res.redirect(`/${encodeURIComponent(user.id)}`);
+});
+
+// ---- QR page ----
+// Public only while the inbox is unclaimed, because linking WhatsApp is how
+// a person gets their setup code in the first place. Once claimed it is
+// private like everything else.
+
+app.get('/:userId/qr', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred, state } = ctx;
+
+  if (isClaimed(cred)) {
+    if (!auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+      return res.redirect(
+        `/${encodeURIComponent(user.id)}/login?next=` + encodeURIComponent(req.originalUrl)
+      );
+    }
+    return res.send(views.qrPage({ user, state }));
+  }
+
+  res.send(
+    views.qrPage({ user, state, claimCode: visibleClaimCode(state), needsSetup: true })
+  );
+});
+
+// ---- Change password ----
+
+app.get('/:userId/password', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (!isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/setup`);
+  if (!auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(
+      `/${encodeURIComponent(user.id)}/login?next=` + encodeURIComponent(req.originalUrl)
+    );
+  }
+  res.send(views.changePasswordPage({ user }));
+});
+
+app.post('/:userId/password', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (!isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/setup`);
+  if (!auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(`/${encodeURIComponent(user.id)}/login`);
+  }
+
+  const body = req.body || {};
+  if (!auth.verifySecret(body.current || '', cred.passwordHash)) {
+    auth.recordFailure(req, user.id);
+    return res
+      .status(401)
+      .send(views.changePasswordPage({ user, error: 'Current password is not right.' }));
+  }
+
+  const problem = auth.passwordProblem(body.password, body.confirm);
+  if (problem) {
+    return res.status(400).send(views.changePasswordPage({ user, error: problem }));
+  }
+
+  const passwordHash = auth.hashSecret(body.password);
+  try {
+    await db.updatePassword(user.id, passwordHash);
+  } catch (err) {
+    console.error(`[${user.id}] password change failed:`, err.message);
+    return res.status(503).send(views.dbErrorPage({ configured: true }));
+  }
+
+  // Cookies are signed with a key derived from the password hash, so the
+  // old ones are already dead; re-issue this browser's so the person who
+  // just changed it stays signed in.
+  auth.setSessionCookie(req, res, user.id, passwordHash);
+  console.log(`[${user.id}] Password changed.`);
+  res.redirect(`/${encodeURIComponent(user.id)}`);
+});
+
+// ---- API gate ----
+// Every /api/:userId/* route requires a session for that same inbox.
+
+app.use('/api/:userId', async (req, res, next) => {
+  const ctx = await resolveInbox(req, res, { json: true });
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (!isClaimed(cred)) {
+    return res.status(403).json({ error: 'This inbox has not been set up yet' });
+  }
+  if (!auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  next();
 });
 
 // ---- Web routes ----
-
-// Home page: pick which person's inbox to view
-app.get('/', (req, res) => {
-  res.send(views.homePage(USERS));
-});
-
-app.get('/:userId/qr', (req, res) => {
-  const user = getUserOr404(req, res);
-  if (!user) return;
-  res.send(views.qrPage({ user, state: sessions.get(user.id) }));
-});
 
 app.get('/api/:userId/status', (req, res) => {
   const user = getUserOr404(req, res);
@@ -299,21 +559,44 @@ app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
   }
 });
 
-app.get('/:userId', (req, res) => {
-  const user = getUserOr404(req, res);
-  if (!user) return;
+app.get('/:userId', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (!isClaimed(cred)) return res.redirect(`/${encodeURIComponent(user.id)}/setup`);
+  if (!auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(
+      `/${encodeURIComponent(user.id)}/login?next=` + encodeURIComponent(req.originalUrl)
+    );
+  }
   res.send(views.viewerPage(user));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log('Users configured:', USERS.map((u) => u.id).join(', '));
-  if (auth.isConfigured) {
-    console.log('Password protection: ON (APP_PASSWORD is set).');
+async function start() {
+  if (db.isConfigured) {
+    try {
+      await db.init();
+      console.log('Credential store ready.');
+    } catch (err) {
+      console.error('Could not reach the credential store:', err.message);
+      console.error('Inboxes stay locked until DATABASE_URL points at a reachable Postgres.');
+    }
   } else {
     console.warn(
-      'Password protection: NOT CONFIGURED. Every page is locked until you ' +
-        'set an APP_PASSWORD environment variable and restart.'
+      'DATABASE_URL is not set. Inbox passwords live in Postgres (Neon), so every ' +
+        'inbox stays locked until it is configured.'
     );
   }
-});
+
+  for (const user of USERS) {
+    sessions.set(user.id, createSessionForUser(user));
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+    console.log('Inboxes configured:', USERS.map((u) => u.id).join(', '));
+  });
+}
+
+start();

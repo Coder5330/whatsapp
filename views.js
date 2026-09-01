@@ -273,6 +273,31 @@ code {
 
 .qr-frame img { width: 240px; height: 240px; display: block; }
 
+.code-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 27px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px dashed var(--accent);
+  border-radius: 12px;
+  padding: 16px 12px;
+  margin: 4px 0 20px;
+  user-select: all;
+  word-break: break-all;
+}
+
+.notice-ok {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 10px;
+  padding: 10px 13px;
+  font-size: 13.5px;
+  text-align: left;
+  margin-bottom: 16px;
+}
+
 .pill {
   display: inline-block;
   font-size: 13px;
@@ -533,18 +558,21 @@ ${body}
 </html>`;
 }
 
-function loginPage({ error = '', next = '/' } = {}) {
+// Shown when an inbox is claimed and needs its owner's password.
+function inboxLoginPage({ user, error = '', next = '' } = {}) {
+  const id = encodeURIComponent(user.id);
+  const nextValue = next || '/' + id;
   return page({
-    title: 'Sign in — WhatsApp Viewer',
+    title: `Sign in to ${user.name} — WhatsApp Viewer`,
     body: `
 <div class="centered">
   <div class="card">
     <div class="logo">${LOCK_ICON}</div>
-    <h1>WhatsApp Viewer</h1>
-    <p class="sub">This inbox is private. Enter the password to continue.</p>
+    <h1>${escapeHtml(user.name)}'s inbox</h1>
+    <p class="sub">This inbox is private. Enter its password to continue.</p>
     ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
-    <form class="stack" method="POST" action="/login">
-      <input type="hidden" name="next" value="${escapeHtml(next)}" />
+    <form class="stack" method="POST" action="/${id}/login">
+      <input type="hidden" name="next" value="${escapeHtml(nextValue)}" />
       <label class="field">
         Password
         <input type="password" name="password" autocomplete="current-password"
@@ -552,47 +580,167 @@ function loginPage({ error = '', next = '/' } = {}) {
       </label>
       <button type="submit">Sign in</button>
     </form>
+    <p class="hint"><a href="/">All inboxes</a></p>
   </div>
 </div>`
   });
 }
 
-function setupPage() {
+// First-run page: the owner proves it is their inbox with the setup code
+// they were shown when they scanned the QR, then picks their own password.
+function inboxSetupPage({ user, error = '', prefillCode = '' } = {}) {
+  const id = encodeURIComponent(user.id);
   return page({
-    title: 'Setup required — WhatsApp Viewer',
+    title: `Set up ${user.name} — WhatsApp Viewer`,
+    body: `
+<div class="centered">
+  <div class="card">
+    <div class="logo">${LOCK_ICON}</div>
+    <h1>Set your password</h1>
+    <p class="sub">
+      Nobody has set a password for ${escapeHtml(user.name)}'s inbox yet.
+      Enter the setup code shown when this WhatsApp was linked, then choose
+      a password only you know.
+    </p>
+    ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
+    <form class="stack" method="POST" action="/${id}/setup">
+      <label class="field">
+        Setup code
+        <input type="text" name="code" value="${escapeHtml(prefillCode)}"
+               placeholder="XXXX-XXXX" autocomplete="off" spellcheck="false"
+               autocapitalize="characters" required ${prefillCode ? '' : 'autofocus'} />
+      </label>
+      <label class="field">
+        New password
+        <input type="password" name="password" autocomplete="new-password"
+               required ${prefillCode ? 'autofocus' : ''} />
+      </label>
+      <label class="field">
+        Confirm password
+        <input type="password" name="confirm" autocomplete="new-password" required />
+      </label>
+      <button type="submit">Set password</button>
+    </form>
+    <p class="hint">
+      Lost the code? Re-link this WhatsApp from the
+      <a href="/${id}/qr">QR page</a> to be shown a new one.
+    </p>
+  </div>
+</div>`
+  });
+}
+
+// Unclaimed, but there is no code to hand out yet — the session was
+// restored from disk rather than scanned in this run, so the code went to
+// the server logs instead of a public page.
+function inboxAwaitingCodePage({ user }) {
+  const id = encodeURIComponent(user.id);
+  return page({
+    title: `${user.name} needs a setup code — WhatsApp Viewer`,
     body: `
 <div class="centered">
   <div class="card wide">
     <div class="logo">${LOCK_ICON}</div>
-    <h1>Set a password first</h1>
+    <h1>Setup code needed</h1>
     <p class="sub">
-      No <code>APP_PASSWORD</code> is configured, so the viewer has locked
-      itself rather than serving anyone's messages to the open internet.
+      ${escapeHtml(user.name)}'s inbox has no password yet, and its WhatsApp
+      was already linked before this server started — so no code was shown
+      on screen.
     </p>
     <p class="hint">
-      Set an <code>APP_PASSWORD</code> environment variable on the service
-      (Railway: <strong>Variables</strong> tab) and redeploy. Everyone who
-      should have access uses that one password to sign in.
+      Whoever runs the server can read the current setup code from the
+      service logs (Railway: <strong>Deployments → View logs</strong>), or
+      you can re-link this WhatsApp from the <a href="/${id}/qr">QR page</a>
+      and the code will be shown right after you scan.
+    </p>
+    <p class="hint"><a href="/${id}/setup">I have a code</a> · <a href="/">All inboxes</a></p>
+  </div>
+</div>`
+  });
+}
+
+function changePasswordPage({ user, error = '', notice = '' } = {}) {
+  const id = encodeURIComponent(user.id);
+  return page({
+    title: `Change password — ${user.name}`,
+    body: `
+<div class="centered">
+  <div class="card">
+    <div class="logo">${LOCK_ICON}</div>
+    <h1>Change password</h1>
+    <p class="sub">For ${escapeHtml(user.name)}'s inbox.</p>
+    ${error ? `<div class="alert">${escapeHtml(error)}</div>` : ''}
+    ${notice ? `<div class="notice-ok">${escapeHtml(notice)}</div>` : ''}
+    <form class="stack" method="POST" action="/${id}/password">
+      <label class="field">
+        Current password
+        <input type="password" name="current" autocomplete="current-password" autofocus required />
+      </label>
+      <label class="field">
+        New password
+        <input type="password" name="password" autocomplete="new-password" required />
+      </label>
+      <label class="field">
+        Confirm new password
+        <input type="password" name="confirm" autocomplete="new-password" required />
+      </label>
+      <button type="submit">Change password</button>
+    </form>
+    <p class="hint">
+      Changing it signs out anyone using the old password.
+      <br /><a href="/${id}">Back to inbox</a>
     </p>
   </div>
 </div>`
   });
 }
 
-function homePage(users) {
-  const cards = users
-    .map((u) => {
-      const id = escapeHtml(u.id);
-      const name = escapeHtml(u.name);
-      const initial = escapeHtml((u.name || u.id).trim().charAt(0) || '?');
+// The credential store is the gate; if it is unreachable the app refuses
+// to serve inboxes rather than guessing that everything is fine.
+function dbErrorPage({ configured }) {
+  return page({
+    title: 'Storage unavailable — WhatsApp Viewer',
+    body: `
+<div class="centered">
+  <div class="card wide">
+    <div class="logo">${LOCK_ICON}</div>
+    <h1>${configured ? 'Cannot reach the database' : 'No database configured'}</h1>
+    <p class="sub">
+      ${
+        configured
+          ? 'Inbox passwords live in Postgres, and that connection is currently failing. The viewer stays locked until it is back.'
+          : 'Inbox passwords live in Postgres. Without <code>DATABASE_URL</code> there is nothing to check passwords against, so the viewer has locked itself.'
+      }
+    </p>
+    <p class="hint">
+      Set <code>DATABASE_URL</code> to the Neon connection string on the
+      service (Railway: <strong>Variables</strong> tab) and redeploy.
+    </p>
+  </div>
+</div>`
+  });
+}
+
+// entries: [{ user, claimed }]
+function homePage(entries) {
+  const cards = entries
+    .map(({ user, claimed }) => {
+      const id = encodeURIComponent(user.id);
+      const name = escapeHtml(user.name);
+      const initial = escapeHtml((user.name || user.id).trim().charAt(0) || '?');
       return `
-      <div class="user-card" data-user="${id}">
+      <div class="user-card">
         <div class="avatar">${initial}</div>
-        <a class="grow" href="/${encodeURIComponent(u.id)}" style="text-decoration:none;color:inherit;">
+        <a class="grow" href="/${id}" style="text-decoration:none;color:inherit;">
           <div class="name">${name}</div>
-          <div class="state"><span class="dot"></span><span class="state-text">Checking…</span></div>
+          <div class="state">
+            <span class="dot ${claimed ? 'on' : 'warn'}"></span>
+            ${claimed ? 'Private — password required' : 'Not set up yet'}
+          </div>
         </a>
-        <a class="qr-link" href="/${encodeURIComponent(u.id)}/qr">Scan QR</a>
+        <a class="qr-link" href="/${id}${claimed ? '' : '/setup'}">${
+          claimed ? 'Sign in' : 'Set password'
+        }</a>
       </div>`;
     })
     .join('');
@@ -605,37 +753,45 @@ function homePage(users) {
     <div class="logo">${CHAT_ICON}</div>
     <div>
       <h1>WhatsApp Viewer</h1>
-      <p>Pick an inbox to browse.</p>
+      <p>Each inbox has its own password, set by its owner.</p>
     </div>
-    <div class="spacer"></div>
-    <form method="POST" action="/logout">
-      <button class="linkbtn" type="submit">Sign out</button>
-    </form>
   </header>
   <div class="user-grid">${cards}</div>
-</div>
-<script>
-  document.querySelectorAll('.user-card').forEach(function (card) {
-    var id = card.getAttribute('data-user');
-    fetch('/api/' + encodeURIComponent(id) + '/status')
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        var dot = card.querySelector('.dot');
-        var text = card.querySelector('.state-text');
-        text.textContent = d.status || 'Unknown';
-        dot.className = 'dot' + (d.ready ? ' on' : (d.hasQr ? ' warn' : ''));
-      })
-      .catch(function () {
-        card.querySelector('.state-text').textContent = 'Status unavailable';
-      });
-  });
-</script>`
+  <p class="hint" style="margin-top:22px;">
+    Signing in to one inbox gives you access to that inbox only.
+  </p>
+</div>`
   });
 }
 
-function qrPage({ user, state }) {
+// claimCode is passed only when this server watched the QR get scanned in
+// this process — never for a session restored from disk, where the QR page
+// is reachable by anyone who has not claimed it yet.
+function qrPage({ user, state, claimCode = null, needsSetup = false }) {
   const name = escapeHtml(user.name);
-  const href = '/' + encodeURIComponent(user.id);
+  const id = encodeURIComponent(user.id);
+
+  if (claimCode) {
+    return page({
+      title: `Linked — set up ${user.name}`,
+      body: `
+<div class="centered">
+  <div class="card">
+    <div class="logo">${CHAT_ICON}</div>
+    <h1>WhatsApp linked</h1>
+    <p class="sub">
+      Here is the one-time setup code for ${name}'s inbox. It is shown only
+      now, only on this screen — use it to choose your password.
+    </p>
+    <div class="code-box">${escapeHtml(claimCode)}</div>
+    <a href="/${id}/setup?code=${encodeURIComponent(claimCode)}">
+      <button type="button">Choose my password</button>
+    </a>
+    <p class="hint">Write it down if you want to finish setup on another device.</p>
+  </div>
+</div>`
+    });
+  }
 
   if (state.isReady) {
     return page({
@@ -646,7 +802,13 @@ function qrPage({ user, state }) {
     <div class="logo">${CHAT_ICON}</div>
     <h1>${name} is connected</h1>
     <p class="sub">No QR code needed — the session is already linked.</p>
-    <a href="${href}"><button type="button">Open inbox</button></a>
+    ${
+      needsSetup
+        ? `<p class="hint">This inbox still has no password. The setup code is in the
+             server logs, or re-link from WhatsApp to be shown a new one.</p>
+           <a href="/${id}/setup"><button type="button">I have a setup code</button></a>`
+        : `<a href="/${id}"><button type="button">Open inbox</button></a>`
+    }
   </div>
 </div>`
     });
@@ -681,7 +843,13 @@ function qrPage({ user, state }) {
       <li>Go to <strong>Settings → Linked Devices</strong>.</li>
       <li>Tap <strong>Link a Device</strong> and scan this code.</li>
     </ol>
-    <p class="hint">Codes expire after a while — this page refreshes itself.</p>
+    <p class="hint">
+      ${
+        needsSetup
+          ? 'After scanning you will be shown a one-time setup code for choosing this inbox&rsquo;s password.'
+          : 'Codes expire after a while — this page refreshes itself.'
+      }
+    </p>
   </div>
 </div>
 <script>setTimeout(function () { location.reload(); }, 20000);</script>`
@@ -703,8 +871,10 @@ function viewerPage(user) {
       <div class="grow">
         <div class="name">${name}</div>
         <a class="back" href="/">&larr; All inboxes</a>
+        &middot;
+        <a class="back" href="/${encodeURIComponent(user.id)}/password">Password</a>
       </div>
-      <form method="POST" action="/logout">
+      <form method="POST" action="/${encodeURIComponent(user.id)}/logout">
         <button class="linkbtn" type="submit">Sign out</button>
       </form>
     </div>
@@ -790,7 +960,11 @@ function viewerPage(user) {
 
   // A 401 means the login cookie expired while the page was open.
   function handleAuth(res) {
-    if (res.status === 401) { location.href = '/login?next=' + encodeURIComponent(location.pathname); return false; }
+    if (res.status === 401) {
+      location.href = '/' + encodeURIComponent(userId) + '/login?next=' +
+        encodeURIComponent(location.pathname);
+      return false;
+    }
     return true;
   }
 
@@ -1013,8 +1187,11 @@ module.exports = {
   FAVICON,
   escapeHtml,
   page,
-  loginPage,
-  setupPage,
+  inboxLoginPage,
+  inboxSetupPage,
+  inboxAwaitingCodePage,
+  changePasswordPage,
+  dbErrorPage,
   homePage,
   qrPage,
   viewerPage

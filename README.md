@@ -18,26 +18,67 @@ where `getChats()` throws a minified `r: r` error after a recent WhatsApp
 Web update. Once that fix is merged and released to npm, switch back to a
 normal version range for long-term stability.
 
-## Password protection
+## Passwords — one per inbox, set by its owner
 
-The whole viewer sits behind a single shared password, set with the
-`APP_PASSWORD` environment variable:
+Each person's inbox has its own password, and **they set it themselves**.
+Signing in to one inbox gives access to that inbox only.
 
-```bash
-APP_PASSWORD='something-long-and-random' node index.js
+Nobody hands out the first password. Instead the server issues a one-time
+**setup code** at the moment a person links their WhatsApp — holding the
+phone that scanned the QR is what proves the inbox is theirs:
+
+1. They open `/<id>/qr` and scan the code with WhatsApp.
+2. The moment it links, the page shows a one-time setup code.
+3. They click through, enter that code, and choose their own password.
+4. From then on `/<id>` asks only for that password, and the code is dead.
+
+An inbox with no password yet is **not** readable — it serves the setup
+page, never messages.
+
+### If the session was already linked
+
+A WhatsApp session restored from the volume never shows a code on screen:
+that page is reachable by anyone until the inbox is claimed, so printing a
+code there would defeat the point. The code goes to the **service logs**
+instead (Railway: *Deployments → View logs*), as a line like:
+
+```
+[joshua] SETUP CODE: 7K2F-9QMX — give this to Joshua to set their password.
 ```
 
-There is no default and no way to opt out. If `APP_PASSWORD` is unset the
-app starts but locks every page and shows a setup notice instead — it fails
-closed rather than quietly serving everyone's messages to the open internet.
+Read it from the logs and pass it to that person privately, or have them
+re-link from the QR page and read the code straight off the screen. A new
+code is issued on every restart while an inbox is unclaimed, so the newest
+line in the logs is the valid one.
 
-Once signed in, a signed, `HttpOnly` cookie keeps you logged in for 7 days.
-The cookie is signed with a key derived from the password, so **changing
-`APP_PASSWORD` immediately signs everyone out**. Set `SESSION_SECRET`
-explicitly if you'd rather control that key yourself.
+### Forgotten passwords
 
-Failed logins are throttled per IP: 8 wrong guesses within 15 minutes locks
-that address out for 15 minutes.
+```bash
+npm run reset-inbox -- joshua
+```
+
+That clears the stored password. Restart the service (or have them re-link)
+and they get a fresh setup code to choose a new one.
+
+### Where the passwords live
+
+In Postgres — a [Neon](https://neon.tech) database, set through
+`DATABASE_URL`:
+
+```bash
+DATABASE_URL='postgresql://user:pass@host/db?sslmode=require'
+```
+
+Passwords and setup codes are stored as salted scrypt hashes, never in
+plaintext. The table is created automatically on first boot. Without a
+reachable `DATABASE_URL` there is nothing to check passwords against, so
+every inbox stays locked rather than falling open.
+
+Signing in sets a signed, `HttpOnly` cookie for that one inbox, good for 7
+days. The signature is derived from the stored password hash, so changing a
+password immediately signs out anything using the old one. Failed attempts
+are throttled per inbox and per IP: 8 wrong guesses in 15 minutes locks that
+pair out for 15 minutes.
 
 ## Adding / removing people
 
@@ -62,14 +103,15 @@ Restart the service after editing the list.
 
 ```bash
 npm install
-APP_PASSWORD='pick-a-password' node index.js
+DATABASE_URL='postgresql://...' node index.js
 ```
 
-Then open `http://localhost:3000` and sign in with that password to see the
-list of configured people, and visit `http://localhost:3000/<id>/qr` for
-each person to scan their own QR code
-(WhatsApp app → Settings → Linked Devices → Link a Device). Once connected,
-`http://localhost:3000/<id>` shows that person's chats.
+Then open `http://localhost:3000` to see the configured inboxes. Visit
+`http://localhost:3000/<id>/qr` for each person to scan their own QR code
+(WhatsApp app → Settings → Linked Devices → Link a Device); the setup code
+appears as soon as it links, and they use it to choose a password. After
+that `http://localhost:3000/<id>` shows that person's chats once they sign
+in.
 
 Session data is stored under `./data/sessions/<id>/` locally (or wherever
 `SESSION_PATH` points) so nobody has to rescan on restart.
@@ -80,18 +122,20 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 2. In Railway: **New Project → Deploy from GitHub repo**, pick this repo.
    Railway detects the `Dockerfile` and `railway.json` and builds with
    Docker automatically.
-3. **Set `APP_PASSWORD`**: open the service → **Variables** tab → add
-   `APP_PASSWORD` with a long random value. Until you do, the deployed app
-   locks itself and shows a setup notice. Share that one password with
-   whoever should be able to read these inboxes.
+3. **Set `DATABASE_URL`**: create a database at
+   [neon.tech](https://neon.tech), copy its connection string, and add it
+   on the service → **Variables** tab. Until you do, every inbox stays
+   locked. Keep the string in Railway's variables only — never commit it.
 4. **Add a volume**: right-click empty space on the project canvas → New →
    Volume → attach it to this service → set the mount path to `/data`.
    This is what makes every person's session survive redeploys — without
    it, everyone has to rescan their QR code each time the service restarts.
-5. Deploy. Once it's up, visit `https://<your-app>.up.railway.app/<id>/qr`
-   for each person and have them scan their own code.
+5. Deploy. Once it's up, send each person their own
+   `https://<your-app>.up.railway.app/<id>/qr` link so they can scan and
+   set their password. For a session that was already linked, read their
+   setup code out of the logs and send it to them privately.
 6. After that, `https://<your-app>.up.railway.app/<id>` shows that
-   person's chats, and the home page (`/`) lists everyone.
+   person's chats to them alone, and the home page (`/`) lists everyone.
 
 ## Notes / limitations
 
@@ -103,11 +147,16 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
   isn't downloaded or rendered in this minimal version.
 - `fetchMessages` pulls up to 100 recent messages per chat on open; older
   history depends on what WhatsApp Web itself has synced.
-- The password is *shared*, not per-person: anyone who can sign in can read
-  every configured person's inbox, not just their own. Everyone behind that
-  one password should already trust each other with these messages.
+- Whoever runs the service can still read everything: they control the
+  server, the session files, and the database. Per-inbox passwords keep
+  people out of *each other's* messages, not out of the operator's reach.
+- A setup code for an already-linked session passes through the service
+  logs, so anyone who can read those logs can claim an unclaimed inbox.
+  Claim them promptly and treat log access as privileged.
 - Login attempts are throttled in memory only, so the counter resets when the
   service restarts and isn't shared across replicas.
+- There is no password reset by email — recovery is `npm run reset-inbox`,
+  which needs access to the deployment.
 - If the WhatsApp Web protocol changes, `whatsapp-web.js` sometimes needs a
   library update to keep working — keep an eye on its GitHub releases/issues
   if things break again.
