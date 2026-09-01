@@ -1,7 +1,10 @@
 FROM node:20-slim
 
-# Install Chromium and libraries whatsapp-web.js/puppeteer needs
+# Install Chromium and libraries whatsapp-web.js/puppeteer needs.
+# git is required because package.json currently points whatsapp-web.js
+# at a GitHub branch (unmerged upstream fix) rather than the npm registry.
 RUN apt-get update && apt-get install -y \
+    git \
     chromium \
     ca-certificates \
     fonts-liberation \
