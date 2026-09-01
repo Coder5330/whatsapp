@@ -50,9 +50,9 @@ RUN npm install --omit=dev
 
 COPY . .
 
-# Session data lives here — mount a Railway volume at this path so
-# you don't have to rescan the QR code on every redeploy.
-ENV SESSION_PATH=/data/session
+# Session data lives here, one subfolder per hardcoded user — mount a
+# Railway volume at /data so nobody has to rescan their QR code on redeploy.
+ENV SESSION_PATH=/data/sessions
 
 EXPOSE 3000
 
