@@ -15,6 +15,20 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // are inserted on first boot and then live in the `inboxes` table like any
 // other; their ids must not change, because each one names a session folder
 // on the volume that is already linked to a real WhatsApp account.
+// Exactly the flags this app ran with when linking worked. Six more were
+// added here once to trim memory, on no evidence that they helped, and
+// linking stopped working in the same commit: --no-zygote in particular
+// disables the process Chromium forks renderers from, and a renderer dying
+// mid-pairing surfaces as "Target closed", "detached Frame", and a LOGOUT
+// that looks for all the world like WhatsApp rejecting the device. Do not
+// add to this list without a measurement showing it is needed.
+const PUPPETEER_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu'
+];
+
 const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
   { id: 'marshall', name: 'Marshall' },
@@ -119,20 +133,7 @@ function buildClient(user, state) {
     ...webVersionOptions,
     puppeteer: {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      // Exactly the flags this app ran with when linking worked. Six more
-      // were added here once to trim memory, on no evidence that they
-      // helped, and linking stopped working in the same commit:
-      // --no-zygote in particular disables the process Chromium forks
-      // renderers from, and a renderer dying mid-pairing surfaces as
-      // "Target closed", "detached Frame", and a LOGOUT that looks for all
-      // the world like WhatsApp rejecting the device. Do not add to this
-      // list without a measurement showing it is needed.
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      args: PUPPETEER_ARGS
     }
   });
 
@@ -1194,6 +1195,45 @@ function renameSessionDir(from, to) {
   }
 }
 
+// Print what this process is actually running with. Several rounds of
+// debugging have been spent on a deploy whose settings were not the ones
+// being discussed, so the log should answer that without anyone guessing.
+async function reportEffectiveConfig(activeLimit) {
+  console.log(
+    'Config: ' +
+      `inboxes=${activeLimit}/${USERS.length}` +
+      `, browser args=${PUPPETEER_ARGS.length}` +
+      `, webVersion=${WHATSAPP_WEB_VERSION || 'live'}` +
+      `, inviteCode=${INVITE_CODE ? 'on' : 'off'}`
+  );
+  console.log('Browser args:', PUPPETEER_ARGS.join(' '));
+
+  if (!WHATSAPP_WEB_VERSION) return;
+
+  // A pinned build that is not in the archive resolves to nothing and the
+  // client quietly loads the live page instead — so claiming it is pinned
+  // would be a lie. Check, and say which it is.
+  const url = WHATSAPP_WEB_VERSION_PATH.replace('{version}', WHATSAPP_WEB_VERSION);
+  try {
+    const res = await fetch(url, { method: 'GET' });
+    if (res.ok) {
+      console.log(`Pinned to WhatsApp Web build ${WHATSAPP_WEB_VERSION}.`);
+    } else {
+      console.warn(
+        `WHATSAPP_WEB_VERSION=${WHATSAPP_WEB_VERSION} is NOT in the archive ` +
+          `(HTTP ${res.status} for ${url}). The pin does nothing — the live build ` +
+          'is used instead. Unset the variable, or pick a build the archive has.'
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `Could not check WHATSAPP_WEB_VERSION=${WHATSAPP_WEB_VERSION}:`,
+      err.message,
+      '- the pin may silently fall back to the live build.'
+    );
+  }
+}
+
 // Launching every Chromium at once is what starves them into timing out.
 const STARTUP_STAGGER_MS = 8000;
 
@@ -1337,10 +1377,8 @@ async function start() {
     if (activeLimit < USERS.length) {
       console.log(`Running only ${activeLimit} of ${USERS.length} inboxes (MAX_ACTIVE_INBOXES).`);
     }
-    if (WHATSAPP_WEB_VERSION) {
-      console.log(`Pinned to WhatsApp Web build ${WHATSAPP_WEB_VERSION}.`);
-    }
     if (INVITE_CODE) console.log('New inboxes require the invite code.');
+    reportEffectiveConfig(activeLimit);
   });
 }
 
