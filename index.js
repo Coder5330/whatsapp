@@ -17,8 +17,8 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // on the volume that is already linked to a real WhatsApp account.
 const SEED_USERS = [
   { id: 'joshua', name: 'Joshua' },
-  { id: 'Marshall', name: 'Marshall' },
-  { id: 'Yuanbin', name: 'Yuanbin' },
+  { id: 'marshall', name: 'Marshall' },
+  { id: 'yuanbin', name: 'Yuanbin' },
 ];
 
 // The live registry, loaded from the database at boot and appended to when
@@ -89,7 +89,15 @@ const app = express();
 // Each entry: { client, latestQr, isReady, statusText }
 const sessions = new Map();
 
-function createSessionForUser(user) {
+// Several Chromium instances competing for a small container will make
+// WhatsApp Web's injection step time out, so a failed start is expected
+// rather than exceptional. Retry it with backoff, and never let the
+// rejection escape: an uncaught one takes the whole server down, and then
+// nobody can reach any inbox.
+const MAX_STARTUP_ATTEMPTS = 5;
+const STARTUP_BASE_DELAY_MS = 5000;
+
+function buildClient(user, state) {
   const sessionPath = path.join(SESSION_ROOT, user.id);
 
   const client = new Client({
@@ -100,34 +108,35 @@ function createSessionForUser(user) {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        // Trim what each instance costs; several run side by side.
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--no-first-run',
+        '--no-zygote'
       ]
     }
   });
 
-  const state = {
-    client,
-    latestQr: null,
-    isReady: false,
-    statusText: 'Starting up...',
-    // Set once this process has actually displayed a QR code, which is how
-    // we know a later 'authenticated' came from someone scanning it here
-    // rather than from a session restored off the volume.
-    sawQrThisRun: false,
-    claimCodePlain: null,
-    codeVisibleUntil: 0
-  };
-
   client.on('qr', async (qr) => {
     state.statusText = 'Scan the QR code below with WhatsApp on your phone.';
     state.sawQrThisRun = true;
-    state.latestQr = await qrcode.toDataURL(qr);
+    state.startupError = null;
+    try {
+      state.latestQr = await qrcode.toDataURL(qr);
+    } catch (err) {
+      console.error(`[${user.id}] Could not render QR code:`, err.message);
+      return;
+    }
     console.log(`[${user.id}] QR code updated. Visit /${user.id}/qr to scan it.`);
   });
 
   client.on('authenticated', () => {
     state.statusText = 'Authenticated. Finishing startup...';
     state.latestQr = null;
+    state.startupError = null;
     // Linking WhatsApp is what proves this inbox belongs to whoever is
     // holding the phone, so that is the moment a setup code is worth
     // issuing — but only while nobody has set a password yet.
@@ -137,6 +146,7 @@ function createSessionForUser(user) {
   client.on('ready', () => {
     state.statusText = 'Connected — syncing chats...';
     state.latestQr = null;
+    state.startupError = null;
     console.log(`[${user.id}] Client ready. Waiting for store to settle...`);
     setTimeout(() => {
       state.isReady = true;
@@ -151,10 +161,81 @@ function createSessionForUser(user) {
     console.log(`[${user.id}] Client disconnected:`, reason);
   });
 
-  client.initialize();
+  return client;
+}
+
+async function startSession(user, state) {
+  state.attempts += 1;
+
+  // A half-initialised client cannot be re-initialised, so each attempt
+  // gets a fresh one.
+  const client = buildClient(user, state);
+  state.client = client;
+  state.statusText =
+    state.attempts === 1 ? 'Starting up...' : `Starting up... (attempt ${state.attempts})`;
+
+  try {
+    await client.initialize();
+    state.startupError = null;
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    console.error(`[${user.id}] Startup attempt ${state.attempts} failed:`, message);
+    state.startupError = message;
+    state.isReady = false;
+    state.latestQr = null;
+
+    try {
+      await client.destroy();
+    } catch {
+      /* the browser may already be gone; nothing to clean up */
+    }
+
+    if (state.attempts >= MAX_STARTUP_ATTEMPTS) {
+      state.statusText =
+        'WhatsApp did not start after several tries. Restart the service to try again.';
+      console.error(`[${user.id}] Giving up after ${state.attempts} attempts.`);
+      return;
+    }
+
+    const delay = Math.min(60000, STARTUP_BASE_DELAY_MS * 2 ** (state.attempts - 1));
+    state.statusText = `WhatsApp did not start. Retrying in ${Math.round(delay / 1000)}s...`;
+    setTimeout(() => {
+      startSession(user, state).catch((e) =>
+        console.error(`[${user.id}] Retry scheduling failed:`, e && e.message)
+      );
+    }, delay);
+  }
+}
+
+// `startAfterMs` staggers the launches. Starting every Chromium at the same
+// instant is what makes them starve each other and time out.
+function createSessionForUser(user, startAfterMs = 0) {
+  const state = {
+    client: null,
+    latestQr: null,
+    isReady: false,
+    statusText: 'Starting up...',
+    // Set once this process has actually displayed a QR code, which is how
+    // we know a later 'authenticated' came from someone scanning it here
+    // rather than from a session restored off the volume.
+    sawQrThisRun: false,
+    claimCodePlain: null,
+    codeVisibleUntil: 0,
+    startupError: null,
+    attempts: 0
+  };
+
+  const launch = () =>
+    startSession(user, state).catch((err) =>
+      console.error(`[${user.id}] Startup failed unexpectedly:`, err && err.message)
+    );
+
+  if (startAfterMs > 0) setTimeout(launch, startAfterMs);
+  else launch();
 
   return state;
 }
+
 
 function getUserOr404(req, res) {
   const user = findUser(req.params.userId);
@@ -170,7 +251,7 @@ async function shutdown(signal) {
   await Promise.all(
     USERS.map(async (user) => {
       const state = sessions.get(user.id);
-      if (!state) return;
+      if (!state || !state.client) return;
       try {
         await state.client.destroy();
       } catch (err) {
@@ -185,6 +266,17 @@ async function shutdown(signal) {
   }
   process.exit(0);
 }
+// whatsapp-web.js drives a browser over a socket, and it surfaces failures
+// asynchronously long after startup. Node's default is to abort on an
+// unhandled rejection, which would take every other inbox down with it, so
+// log and keep serving instead.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason && reason.message ? reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && err.stack ? err.stack : err);
+});
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
@@ -591,7 +683,12 @@ app.get('/api/:userId/status', (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
   const state = sessions.get(user.id);
-  res.json({ ready: state.isReady, status: state.statusText, hasQr: !!state.latestQr });
+  res.json({
+    ready: state.isReady,
+    status: state.statusText,
+    hasQr: !!state.latestQr,
+    startupError: state.startupError || null
+  });
 });
 
 app.get('/api/:userId/chats', async (req, res) => {
@@ -783,10 +880,58 @@ app.get('/:userId', async (req, res) => {
   res.send(views.viewerPage(user));
 });
 
+// Sessions live at <SESSION_ROOT>/<id>, so folding an id in the database
+// has to move the matching directory or the inbox comes up unlinked and
+// asks for a fresh QR scan.
+function renameSessionDir(from, to) {
+  const fromPath = path.join(SESSION_ROOT, from);
+  const toPath = path.join(SESSION_ROOT, to);
+
+  if (!fs.existsSync(fromPath)) return;
+  if (fs.existsSync(toPath)) {
+    // Something is already there. Only replace it if it holds no session.
+    let entries = [];
+    try {
+      entries = fs.readdirSync(toPath);
+    } catch {
+      return;
+    }
+    if (entries.length > 0) {
+      console.warn(
+        `Not moving ${fromPath} onto ${toPath}: both exist and the target is not empty. ` +
+          'The linked session may need re-scanning.'
+      );
+      return;
+    }
+    try {
+      fs.rmSync(toPath, { recursive: true, force: true });
+    } catch (err) {
+      console.warn(`Could not clear ${toPath}:`, err.message);
+      return;
+    }
+  }
+
+  try {
+    fs.renameSync(fromPath, toPath);
+    console.log(`Moved session directory ${from} -> ${to}.`);
+  } catch (err) {
+    console.warn(`Could not move ${fromPath} to ${toPath}:`, err.message);
+  }
+}
+
+// Launching every Chromium at once is what starves them into timing out.
+const STARTUP_STAGGER_MS = 8000;
+
 async function start() {
   if (db.isConfigured) {
     try {
       await db.init();
+
+      // Fold any mixed-case ids before seeding, so seeding does not race
+      // against a row that is about to be renamed onto the same id.
+      const renames = await db.mergeMixedCaseInboxes();
+      for (const { from, to } of renames) renameSessionDir(from, to);
+
       await db.seedInboxes(SEED_USERS);
       USERS = await db.listInboxes();
       console.log('Credential store ready.');
@@ -805,18 +950,22 @@ async function start() {
     USERS = SEED_USERS.slice();
   }
 
-  // Ignore anything in the registry whose id could escape the sessions
-  // directory. Ids are slugs on the way in, so this only fires if a row was
-  // edited by hand.
-  const unsafe = USERS.filter((u) => !isSafeInboxId(u.id) && !SEED_USERS.some((s) => s.id === u.id));
+  // Ids are slugs on the way in and folded to lowercase on the way out of
+  // the database, so this should never fire. If it does, the row was edited
+  // by hand into something that could climb out of the sessions directory —
+  // say so loudly rather than dropping an inbox in silence.
+  const unsafe = USERS.filter((u) => !isSafeInboxId(u.id));
   if (unsafe.length) {
-    console.error('Ignoring inboxes with unsafe ids:', unsafe.map((u) => u.id).join(', '));
-    USERS = USERS.filter((u) => !unsafe.includes(u));
+    console.error(
+      'REFUSING to start these inboxes because their ids are not safe directory names:',
+      unsafe.map((u) => u.id).join(', ')
+    );
+    USERS = USERS.filter((u) => isSafeInboxId(u.id));
   }
 
-  for (const user of USERS) {
-    sessions.set(user.id, createSessionForUser(user));
-  }
+  USERS.forEach((user, i) => {
+    sessions.set(user.id, createSessionForUser(user, i * STARTUP_STAGGER_MS));
+  });
 
   app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
@@ -824,6 +973,12 @@ async function start() {
       `Inboxes (${USERS.length}/${db.MAX_INBOXES}):`,
       USERS.map((u) => u.id).join(', ') || '(none yet)'
     );
+    if (USERS.length > 1) {
+      console.log(
+        `Starting them ${STARTUP_STAGGER_MS / 1000}s apart; the last one is ready in about ` +
+          `${Math.round(((USERS.length - 1) * STARTUP_STAGGER_MS) / 1000)}s.`
+      );
+    }
     if (INVITE_CODE) console.log('New inboxes require the invite code.');
   });
 }

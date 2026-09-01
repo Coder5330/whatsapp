@@ -907,18 +907,30 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
   }
 
   if (!state.latestQr) {
+    // A startup failure used to look exactly like "still starting" — the
+    // same spinner, forever. Say which one it is.
+    const failed = !!state.startupError;
     return page({
-      title: `Waiting for QR — ${user.name}`,
+      title: failed ? `Startup trouble — ${user.name}` : `Waiting for QR — ${user.name}`,
       body: `
 <div class="centered">
   <div class="card">
-    <div class="spinner"></div>
-    <h1>Generating QR code…</h1>
+    ${failed ? `<div class="logo">${LOCK_ICON}</div>` : '<div class="spinner"></div>'}
+    <h1>${failed ? 'WhatsApp did not start' : 'Generating QR code…'}</h1>
     <p class="sub">${escapeHtml(state.statusText)}</p>
-    <span class="pill">This page refreshes automatically</span>
+    ${
+      failed
+        ? `<div class="alert">${escapeHtml(state.startupError)}</div>
+           <p class="hint">
+             This usually means the server ran short of memory while starting
+             the browser for this inbox. It retries on its own; if it keeps
+             failing, restart the service or run fewer inboxes.
+           </p>`
+        : '<span class="pill">This page refreshes automatically</span>'
+    }
   </div>
 </div>
-<script>setTimeout(function () { location.reload(); }, 4000);</script>`
+<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : 4000});</script>`
     });
   }
 

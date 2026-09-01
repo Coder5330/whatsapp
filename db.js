@@ -179,6 +179,76 @@ async function createInbox(id, name) {
   return rowCount > 0;
 }
 
+// Ids are lowercase slugs, but earlier versions seeded them straight from a
+// hardcoded list that used capitals ("Marshall"). Postgres text keys are
+// case-sensitive, so "Marshall" and "marshall" became two inboxes — two
+// Chromium instances, two setup codes, one of them pointing at an empty
+// session. Fold each mixed-case row down onto its lowercase id.
+//
+// Returns the renames it performed so the caller can move the matching
+// session directories on disk.
+async function mergeMixedCaseInboxes() {
+  const { rows } = await getPool().query(
+    'SELECT id FROM inboxes WHERE id <> lower(id)'
+  );
+  const renames = [];
+
+  for (const { id } of rows) {
+    const lower = id.toLowerCase();
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN');
+
+      const { rows: existing } = await client.query(
+        'SELECT id FROM inboxes WHERE id = $1',
+        [lower]
+      );
+
+      if (existing.length === 0) {
+        // Nothing in the way — just rename it, credentials and all.
+        await client.query('UPDATE inboxes SET id = $2 WHERE id = $1', [id, lower]);
+        await client.query(
+          'UPDATE inbox_credentials SET user_id = $2 WHERE user_id = $1',
+          [id, lower]
+        );
+      } else {
+        // Both exist. Keep whichever credential someone has actually set a
+        // password on; a claimed inbox is a person who has already been
+        // through setup, and losing that would lock them out.
+        const { rows: creds } = await client.query(
+          `SELECT user_id, password_hash FROM inbox_credentials
+            WHERE user_id IN ($1, $2)`,
+          [id, lower]
+        );
+        const mixed = creds.find((c) => c.user_id === id);
+        const plain = creds.find((c) => c.user_id === lower);
+
+        if (mixed && mixed.password_hash && !(plain && plain.password_hash)) {
+          await client.query('DELETE FROM inbox_credentials WHERE user_id = $1', [lower]);
+          await client.query(
+            'UPDATE inbox_credentials SET user_id = $2 WHERE user_id = $1',
+            [id, lower]
+          );
+        } else {
+          await client.query('DELETE FROM inbox_credentials WHERE user_id = $1', [id]);
+        }
+        await client.query('DELETE FROM inboxes WHERE id = $1', [id]);
+      }
+
+      await client.query('COMMIT');
+      renames.push({ from: id, to: lower });
+      console.log(`Folded inbox "${id}" onto "${lower}".`);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error(`Could not fold inbox "${id}" onto "${lower}":`, err.message);
+    } finally {
+      client.release();
+    }
+  }
+
+  return renames;
+}
+
 // Carry the previously hardcoded people into the registry on first boot,
 // keeping their ids so their existing session folders still match.
 async function seedInboxes(users) {
@@ -200,6 +270,7 @@ module.exports = {
   isConfigured,
   init,
   listInboxes,
+  mergeMixedCaseInboxes,
   countInboxes,
   inboxExists,
   createInbox,

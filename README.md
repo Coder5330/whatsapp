@@ -95,9 +95,19 @@ The name becomes a URL slug — "Dan Lee" becomes `dan-lee` — used for:
 - Viewer page: `/<id>`
 - Session folder on disk: `<SESSION_PATH>/<id>/`
 
-The two people who were hardcoded before (`joshua`, `Marshall`) are inserted
-into the database on first boot with their original ids, so their existing
-linked sessions keep working.
+The people who were hardcoded before are inserted into the database on first
+boot, so their existing linked sessions keep working.
+
+Ids are always lowercase. An earlier version seeded them straight from the
+hardcoded list, which used capitals (`Marshall`), and because Postgres text
+keys are case-sensitive that could leave both `Marshall` and `marshall` in
+the table — two inboxes, two Chromium instances, one of them pointing at an
+empty session. On boot the app now folds any mixed-case row down onto its
+lowercase id, keeping whichever of the two had a password actually set, and
+moves the session directory to match. If both directories hold a real
+session it refuses to overwrite either and says so in the logs; check for
+`Not moving ...` there, since the leftover directory can then be deleted by
+hand once you know which one is live.
 
 ### Locking down who can add one
 
@@ -182,7 +192,16 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 - Each linked person runs their own headless Chromium instance
   simultaneously — this uses meaningfully more RAM per person (roughly
   150–300MB each). Keep an eye on Railway's memory graph as you add people;
-  you may need to bump the service's plan/resources.
+  you may need to bump the service's plan/resources. **Four inboxes needs
+  roughly 1GB.** When memory runs short, WhatsApp Web's injection step times
+  out with `Waiting failed: 30000ms exceeded` and that inbox shows "WhatsApp
+  did not start" instead of a QR code.
+- Inboxes start 8 seconds apart rather than all at once, because several
+  Chromium instances launching together starve each other into exactly that
+  timeout. The last inbox is therefore ready a little after the first.
+- A client that fails to start is retried five times with backoff, and the
+  failure is confined to that one inbox — the server keeps serving the
+  others rather than exiting.
 - Media is downloaded on demand through the server, so opening a chat full
   of large photos uses bandwidth and memory on the service, not just in the
   browser.
