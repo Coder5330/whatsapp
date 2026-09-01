@@ -174,6 +174,8 @@ function buildClient(user, state) {
     state.latestQr = null;
     state.startupError = null;
     state.needsRelink = false;
+    state.everAuthenticated = true;
+    state.pairingFailures = 0;
     // Between here and 'ready' the QR is gone but the inbox is not usable
     // yet. Without a flag for it the page falls back to "Generating QR
     // code..." — so a scan that just succeeded looks like one that hung.
@@ -266,6 +268,12 @@ function parkDeadSession(id) {
 // A disconnect used to be terminal: the client was dead, no QR was ever
 // produced, and the page sat on its spinner telling people to restart the
 // service. Recover on our own instead.
+// How many times an inbox may disconnect without ever having authenticated
+// before we stop regenerating codes. Each cycle is a fresh pairing attempt
+// against WhatsApp, and hammering that is what gets an account told it
+// "can't link new devices right now".
+const MAX_PAIRING_ATTEMPTS = 3;
+
 async function handleDisconnect(user, state, reason) {
   if (state.restarting) return;
   state.restarting = true;
@@ -275,21 +283,50 @@ async function handleDisconnect(user, state, reason) {
   state.authenticating = false;
   state.latestQr = null;
 
-  const unlinked = UNLINKED_REASONS.has(String(reason));
-  state.needsRelink = unlinked;
-  state.statusText = unlinked
+  // A LOGOUT only means "the stored session was revoked" if there was a
+  // working session to revoke. WhatsApp also reports LOGOUT when a pairing
+  // fails or is interrupted part-way, and treating that as a revocation
+  // throws away the credentials the scan just created — so the phone shows
+  // a linked device while this end discards it and puts up a new code, over
+  // and over. Only discard a session this client actually authenticated.
+  const revoked = UNLINKED_REASONS.has(String(reason)) && state.everAuthenticated;
+
+  if (!revoked && UNLINKED_REASONS.has(String(reason))) {
+    state.pairingFailures = (state.pairingFailures || 0) + 1;
+    console.warn(
+      `[${user.id}] Disconnected (${reason}) without ever authenticating — treating as a ` +
+        `failed pairing (${state.pairingFailures}/${MAX_PAIRING_ATTEMPTS}), keeping the stored session.`
+    );
+  }
+
+  state.needsRelink = revoked;
+  state.statusText = revoked
     ? `WhatsApp signed this device out (${reason}). Scan the new code to re-link.`
     : `Disconnected (${reason}). Reconnecting...`;
 
   try {
-    await state.client.destroy();
+    if (state.client) await state.client.destroy();
   } catch {
     /* the browser is usually already gone by the time we hear about it */
   }
 
-  // The stored credentials are revoked, so leaving them in place would just
-  // make the next start fail the same way.
-  if (unlinked) parkDeadSession(user.id);
+  // Only now, with a genuinely revoked session, are the stored credentials
+  // useless and worth moving out of the way.
+  if (revoked) parkDeadSession(user.id);
+
+  if (!revoked && state.pairingFailures >= MAX_PAIRING_ATTEMPTS) {
+    state.startupError =
+      `Pairing kept failing (${reason}). WhatsApp accepted the scan but this end never ` +
+      'finished signing in.';
+    state.statusText =
+      'Pairing is not completing. Restart the service to try again, rather than rescanning.';
+    state.restarting = false;
+    console.error(
+      `[${user.id}] Giving up after ${state.pairingFailures} failed pairings. Not generating ` +
+        'another code — repeated attempts are what get an account blocked from linking.'
+    );
+    return;
+  }
 
   state.attempts = 0;
   state.sawQrThisRun = false;
@@ -366,6 +403,8 @@ function dormantSession() {
     restarting: false,
     settleTimer: null,
     authenticating: false,
+    everAuthenticated: false,
+    pairingFailures: 0,
     dormant: true
   };
 }
@@ -389,7 +428,9 @@ function createSessionForUser(user, startAfterMs = 0) {
     needsRelink: false,
     restarting: false,
     settleTimer: null,
-    authenticating: false
+    authenticating: false,
+    everAuthenticated: false,
+    pairingFailures: 0
   };
 
   const launch = () =>
