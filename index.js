@@ -1,9 +1,47 @@
 const express = require('express');
 const qrcode = require('qrcode');
+const fs = require('fs');
+const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_PATH = process.env.SESSION_PATH || '/data/session';
+
+// Chromium writes a SingletonLock (and related Singleton* files) into its
+// profile directory while running. If the container is killed or crashes
+// without Chromium shutting down cleanly, those files are left behind on
+// the persistent volume. On the next boot Chromium sees the stale lock and
+// refuses to start, thinking another process still owns the profile — even
+// though that process is long gone. Clear them before every launch.
+function clearStaleChromiumLocks(rootDir) {
+  if (!fs.existsSync(rootDir)) return;
+  const lockNames = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+  const stack = [rootDir];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (lockNames.has(entry.name)) {
+        try {
+          fs.unlinkSync(full);
+          console.log('Removed stale Chromium lock file:', full);
+        } catch (err) {
+          console.warn('Could not remove lock file:', full, err.message);
+        }
+      }
+    }
+  }
+}
+
+clearStaleChromiumLocks(SESSION_PATH);
 
 const app = express();
 
@@ -76,6 +114,18 @@ client.on('message_create', async (msg) => {
 });
 
 client.initialize();
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down client...`);
+  try {
+    await client.destroy();
+  } catch (err) {
+    console.warn('Error during client.destroy():', err.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // ---- Web routes ----
 
