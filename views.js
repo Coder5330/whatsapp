@@ -911,14 +911,17 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     // same spinner, forever. Say which one it is.
     const dormant = !!state.dormant;
     const failed = !dormant && !!state.startupError;
-    const relinking = !dormant && !failed && !!state.needsRelink;
+    const linking = !dormant && !failed && !!state.authenticating;
+    const relinking = !dormant && !failed && !linking && !!state.needsRelink;
     const heading = dormant
       ? 'This inbox is not running'
       : failed
         ? 'WhatsApp did not start'
-        : relinking
-          ? 'WhatsApp signed this device out'
-          : 'Generating QR code…';
+        : linking
+          ? 'Scan accepted — finishing sign-in'
+          : relinking
+            ? 'WhatsApp signed this device out'
+            : 'Generating QR code…';
     return page({
       title: failed
         ? `Startup trouble — ${user.name}`
@@ -946,6 +949,12 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
              the browser for this inbox. It retries on its own; if it keeps
              failing, restart the service or run fewer inboxes.
            </p>`
+        : linking
+          ? `<p class="hint">
+               WhatsApp accepted the scan. This inbox is syncing now, which
+               takes a few seconds — the page moves on by itself.
+             </p>
+             <span class="pill">Finishing…</span>`
         : relinking
           ? `<p class="hint">
                This happens when the device is removed under WhatsApp &rarr;
@@ -959,7 +968,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     }
   </div>
 </div>
-${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : 4000});</script>`}`
+${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : linking ? 2500 : 4000});</script>`}`
     });
   }
 
@@ -985,7 +994,7 @@ ${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${faile
     </p>
   </div>
 </div>
-<script>setTimeout(function () { location.reload(); }, 20000);</script>`
+<script>setTimeout(function () { location.reload(); }, 6000);</script>`
   });
 }
 

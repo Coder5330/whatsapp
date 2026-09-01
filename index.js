@@ -170,10 +170,14 @@ function buildClient(user, state) {
   });
 
   client.on('authenticated', () => {
-    state.statusText = 'Authenticated. Finishing startup...';
+    state.statusText = 'Linked. Finishing sign-in...';
     state.latestQr = null;
     state.startupError = null;
     state.needsRelink = false;
+    // Between here and 'ready' the QR is gone but the inbox is not usable
+    // yet. Without a flag for it the page falls back to "Generating QR
+    // code..." — so a scan that just succeeded looks like one that hung.
+    state.authenticating = true;
     // Linking WhatsApp is what proves this inbox belongs to whoever is
     // holding the phone, so that is the moment a setup code is worth
     // issuing — but only while nobody has set a password yet.
@@ -198,6 +202,7 @@ function buildClient(user, state) {
         return;
       }
       state.isReady = true;
+      state.authenticating = false;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Store settle period complete.`);
       // Which WhatsApp Web build we actually ended up on, and on what
@@ -267,6 +272,7 @@ async function handleDisconnect(user, state, reason) {
 
   clearTimeout(state.settleTimer);
   state.isReady = false;
+  state.authenticating = false;
   state.latestQr = null;
 
   const unlinked = UNLINKED_REASONS.has(String(reason));
@@ -316,6 +322,7 @@ async function startSession(user, state) {
     state.startupError = message;
     clearTimeout(state.settleTimer);
     state.isReady = false;
+    state.authenticating = false;
     state.latestQr = null;
 
     try {
@@ -358,6 +365,7 @@ function dormantSession() {
     needsRelink: false,
     restarting: false,
     settleTimer: null,
+    authenticating: false,
     dormant: true
   };
 }
@@ -380,7 +388,8 @@ function createSessionForUser(user, startAfterMs = 0) {
     attempts: 0,
     needsRelink: false,
     restarting: false,
-    settleTimer: null
+    settleTimer: null,
+    authenticating: false
   };
 
   const launch = () =>
@@ -846,7 +855,8 @@ app.get('/api/:userId/status', (req, res) => {
     status: state.statusText,
     hasQr: !!state.latestQr,
     startupError: state.startupError || null,
-    needsRelink: !!state.needsRelink
+    needsRelink: !!state.needsRelink,
+    authenticating: !!state.authenticating
   });
 });
 
