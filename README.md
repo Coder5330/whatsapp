@@ -202,6 +202,13 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 - A client that fails to start is retried five times with backoff, and the
   failure is confined to that one inbox — the server keeps serving the
   others rather than exiting.
+- If WhatsApp signs a device out (`LOGOUT`, `UNPAIRED`, `CONFLICT` — someone
+  removed it under **Linked Devices**, or the link sat offline too long) the
+  stored session is revoked and can never work again. That inbox parks the
+  dead session under `<id>.loggedout-<timestamp>`, restarts itself, and shows
+  a fresh QR code to re-link. **The inbox password is unaffected**, so there
+  is no setup code to enter again — just scan. One previous parked session is
+  kept per inbox and older ones are pruned.
 - Media is downloaded on demand through the server, so opening a chat full
   of large photos uses bandwidth and memory on the service, not just in the
   browser.

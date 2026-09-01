@@ -910,13 +910,23 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     // A startup failure used to look exactly like "still starting" — the
     // same spinner, forever. Say which one it is.
     const failed = !!state.startupError;
+    const relinking = !failed && !!state.needsRelink;
+    const heading = failed
+      ? 'WhatsApp did not start'
+      : relinking
+        ? 'WhatsApp signed this device out'
+        : 'Generating QR code…';
     return page({
-      title: failed ? `Startup trouble — ${user.name}` : `Waiting for QR — ${user.name}`,
+      title: failed
+        ? `Startup trouble — ${user.name}`
+        : relinking
+          ? `Re-link ${user.name} — WhatsApp Viewer`
+          : `Waiting for QR — ${user.name}`,
       body: `
 <div class="centered">
   <div class="card">
     ${failed ? `<div class="logo">${LOCK_ICON}</div>` : '<div class="spinner"></div>'}
-    <h1>${failed ? 'WhatsApp did not start' : 'Generating QR code…'}</h1>
+    <h1>${heading}</h1>
     <p class="sub">${escapeHtml(state.statusText)}</p>
     ${
       failed
@@ -926,7 +936,16 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
              the browser for this inbox. It retries on its own; if it keeps
              failing, restart the service or run fewer inboxes.
            </p>`
-        : '<span class="pill">This page refreshes automatically</span>'
+        : relinking
+          ? `<p class="hint">
+               This happens when the device is removed under WhatsApp &rarr;
+               Linked Devices, or when WhatsApp expires a link that has been
+               offline too long. A fresh code is being generated now — scan it
+               and everything comes back. <strong>The inbox password is
+               unchanged</strong>, so there is no setup code to enter again.
+             </p>
+             <span class="pill">This page refreshes automatically</span>`
+          : '<span class="pill">This page refreshes automatically</span>'
     }
   </div>
 </div>
@@ -939,7 +958,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     body: `
 <div class="centered">
   <div class="card">
-    <h1>Link ${name}'s WhatsApp</h1>
+    <h1>${state.needsRelink ? `Re-link ${name}'s WhatsApp` : `Link ${name}'s WhatsApp`}</h1>
     <p class="sub">${escapeHtml(state.statusText)}</p>
     <div class="qr-frame"><img src="${state.latestQr}" alt="WhatsApp linking QR code" /></div>
     <ol class="steps">

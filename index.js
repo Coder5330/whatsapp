@@ -137,6 +137,7 @@ function buildClient(user, state) {
     state.statusText = 'Authenticated. Finishing startup...';
     state.latestQr = null;
     state.startupError = null;
+    state.needsRelink = false;
     // Linking WhatsApp is what proves this inbox belongs to whoever is
     // holding the phone, so that is the moment a setup code is worth
     // issuing — but only while nobody has set a password yet.
@@ -148,7 +149,18 @@ function buildClient(user, state) {
     state.latestQr = null;
     state.startupError = null;
     console.log(`[${user.id}] Client ready. Waiting for store to settle...`);
-    setTimeout(() => {
+
+    clearTimeout(state.settleTimer);
+    state.settleTimer = setTimeout(() => {
+      // This fires eight seconds after the client said it was ready, which
+      // is long enough for the client to have been signed out and replaced
+      // in the meantime. Only the client that is still current may mark the
+      // inbox connected, or a dead session comes back to life and the UI
+      // cheerfully reports "connected" for a browser that is gone.
+      if (state.client !== client) {
+        console.log(`[${user.id}] Ignoring settle timer from a replaced client.`);
+        return;
+      }
       state.isReady = true;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Store settle period complete.`);
@@ -156,12 +168,82 @@ function buildClient(user, state) {
   });
 
   client.on('disconnected', (reason) => {
-    state.isReady = false;
-    state.statusText = `Disconnected: ${reason}. Restart the service to reconnect.`;
     console.log(`[${user.id}] Client disconnected:`, reason);
+    handleDisconnect(user, state, reason);
   });
 
   return client;
+}
+
+// WhatsApp tells us why the device dropped. These reasons mean the linked
+// device was revoked — the stored session can never work again, and the only
+// way back is a fresh scan. Anything else may just be a blip worth retrying
+// on the existing session.
+const UNLINKED_REASONS = new Set(['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 'CONFLICT']);
+
+// Move a dead session out of the way rather than deleting it: the auth blob
+// is worthless once revoked, but it sits next to cached message data, and
+// this runs without anyone watching. Keep one previous copy per inbox so the
+// volume cannot fill up with them.
+function parkDeadSession(id) {
+  const live = path.join(SESSION_ROOT, id);
+  if (!fs.existsSync(live)) return;
+
+  try {
+    fs.renameSync(live, path.join(SESSION_ROOT, `${id}.loggedout-${Date.now()}`));
+    console.log(`[${id}] Parked the revoked session; a fresh QR code will be generated.`);
+  } catch (err) {
+    console.warn(`[${id}] Could not park the revoked session:`, err.message);
+    return;
+  }
+
+  try {
+    const stale = fs
+      .readdirSync(SESSION_ROOT)
+      .filter((name) => name.startsWith(`${id}.loggedout-`))
+      .sort();
+    for (const name of stale.slice(0, -1)) {
+      fs.rmSync(path.join(SESSION_ROOT, name), { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.warn(`[${id}] Could not prune old parked sessions:`, err.message);
+  }
+}
+
+// A disconnect used to be terminal: the client was dead, no QR was ever
+// produced, and the page sat on its spinner telling people to restart the
+// service. Recover on our own instead.
+async function handleDisconnect(user, state, reason) {
+  if (state.restarting) return;
+  state.restarting = true;
+
+  clearTimeout(state.settleTimer);
+  state.isReady = false;
+  state.latestQr = null;
+
+  const unlinked = UNLINKED_REASONS.has(String(reason));
+  state.needsRelink = unlinked;
+  state.statusText = unlinked
+    ? `WhatsApp signed this device out (${reason}). Scan the new code to re-link.`
+    : `Disconnected (${reason}). Reconnecting...`;
+
+  try {
+    await state.client.destroy();
+  } catch {
+    /* the browser is usually already gone by the time we hear about it */
+  }
+
+  // The stored credentials are revoked, so leaving them in place would just
+  // make the next start fail the same way.
+  if (unlinked) parkDeadSession(user.id);
+
+  state.attempts = 0;
+  state.sawQrThisRun = false;
+  state.restarting = false;
+
+  startSession(user, state).catch((err) =>
+    console.error(`[${user.id}] Reconnect failed:`, err && err.message)
+  );
 }
 
 async function startSession(user, state) {
@@ -171,8 +253,11 @@ async function startSession(user, state) {
   // gets a fresh one.
   const client = buildClient(user, state);
   state.client = client;
-  state.statusText =
-    state.attempts === 1 ? 'Starting up...' : `Starting up... (attempt ${state.attempts})`;
+  state.statusText = state.needsRelink
+    ? 'Generating a new code to re-link this WhatsApp...'
+    : state.attempts === 1
+      ? 'Starting up...'
+      : `Starting up... (attempt ${state.attempts})`;
 
   try {
     await client.initialize();
@@ -181,6 +266,7 @@ async function startSession(user, state) {
     const message = err && err.message ? err.message : String(err);
     console.error(`[${user.id}] Startup attempt ${state.attempts} failed:`, message);
     state.startupError = message;
+    clearTimeout(state.settleTimer);
     state.isReady = false;
     state.latestQr = null;
 
@@ -222,7 +308,10 @@ function createSessionForUser(user, startAfterMs = 0) {
     claimCodePlain: null,
     codeVisibleUntil: 0,
     startupError: null,
-    attempts: 0
+    attempts: 0,
+    needsRelink: false,
+    restarting: false,
+    settleTimer: null
   };
 
   const launch = () =>
@@ -687,7 +776,8 @@ app.get('/api/:userId/status', (req, res) => {
     ready: state.isReady,
     status: state.statusText,
     hasQr: !!state.latestQr,
-    startupError: state.startupError || null
+    startupError: state.startupError || null,
+    needsRelink: !!state.needsRelink
   });
 });
 
