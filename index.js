@@ -12,8 +12,7 @@ const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
 // name, so keep it simple (lowercase, no spaces).
 const USERS = [
   { id: 'joshua', name: 'Joshua' },
-  { id: 'friend2', name: 'Friend 2' }
-  { id: 'friend3', name: 'Friend 3' },
+  { id: 'Marshall', name: 'Marshall' },
 ];
 
 // Chromium writes a SingletonLock (and related Singleton* files) into its
