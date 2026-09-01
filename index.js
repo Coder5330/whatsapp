@@ -283,26 +283,46 @@ async function handleDisconnect(user, state, reason) {
   state.authenticating = false;
   state.latestQr = null;
 
-  // A LOGOUT only means "the stored session was revoked" if there was a
-  // working session to revoke. WhatsApp also reports LOGOUT when a pairing
-  // fails or is interrupted part-way, and treating that as a revocation
-  // throws away the credentials the scan just created — so the phone shows
-  // a linked device while this end discards it and puts up a new code, over
-  // and over. Only discard a session this client actually authenticated.
-  const revoked = UNLINKED_REASONS.has(String(reason)) && state.everAuthenticated;
+  // Three different things arrive as the same LOGOUT, and which one it is
+  // decides whether the stored session may be thrown away. Whether a QR has
+  // been shown yet in this run is what separates them:
+  //
+  //   before any QR   -> we were restoring the saved session and WhatsApp
+  //                      rejected it. Those credentials are provably dead
+  //                      (the device was unpaired, say), so clear them or
+  //                      every restart repeats this.
+  //   after a QR      -> someone scanned and the pairing did not complete.
+  //                      The credentials here are the ones that scan just
+  //                      created; discarding them is what made a linked
+  //                      phone never sign in.
+  //   after authenticating -> a session that was genuinely working has been
+  //                      revoked. Clear it and ask for a new scan.
+  const unlinkedReason = UNLINKED_REASONS.has(String(reason));
+  const revoked = unlinkedReason && state.everAuthenticated;
+  const storedSessionRejected = unlinkedReason && !state.everAuthenticated && !state.sawQrThisRun;
+  const pairingFailed = unlinkedReason && !state.everAuthenticated && state.sawQrThisRun;
 
-  if (!revoked && UNLINKED_REASONS.has(String(reason))) {
+  if (storedSessionRejected) {
+    console.warn(
+      `[${user.id}] The stored session was rejected (${reason}) before any code was shown — ` +
+        'it is no longer valid, most likely unpaired from the phone. Clearing it.'
+    );
+  }
+
+  if (pairingFailed) {
     state.pairingFailures = (state.pairingFailures || 0) + 1;
     console.warn(
-      `[${user.id}] Disconnected (${reason}) without ever authenticating — treating as a ` +
+      `[${user.id}] Disconnected (${reason}) after a scan but before signing in — treating as a ` +
         `failed pairing (${state.pairingFailures}/${MAX_PAIRING_ATTEMPTS}), keeping the stored session.`
     );
   }
 
-  state.needsRelink = revoked;
+  state.needsRelink = revoked || storedSessionRejected;
   state.statusText = revoked
     ? `WhatsApp signed this device out (${reason}). Scan the new code to re-link.`
-    : `Disconnected (${reason}). Reconnecting...`;
+    : storedSessionRejected
+      ? 'The saved WhatsApp link is no longer valid. Scan the new code to link again.'
+      : `Disconnected (${reason}). Reconnecting...`;
 
   try {
     if (state.client) await state.client.destroy();
@@ -310,11 +330,10 @@ async function handleDisconnect(user, state, reason) {
     /* the browser is usually already gone by the time we hear about it */
   }
 
-  // Only now, with a genuinely revoked session, are the stored credentials
-  // useless and worth moving out of the way.
-  if (revoked) parkDeadSession(user.id);
+  // Both of these mean the stored credentials cannot work again.
+  if (revoked || storedSessionRejected) parkDeadSession(user.id);
 
-  if (!revoked && state.pairingFailures >= MAX_PAIRING_ATTEMPTS) {
+  if (pairingFailed && state.pairingFailures >= MAX_PAIRING_ATTEMPTS) {
     state.startupError =
       `Pairing kept failing (${reason}). WhatsApp accepted the scan but this end never ` +
       'finished signing in.';
