@@ -5,7 +5,16 @@ const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
 const PORT = process.env.PORT || 3000;
-const SESSION_PATH = process.env.SESSION_PATH || '/data/session';
+const SESSION_ROOT = process.env.SESSION_PATH || '/data/sessions';
+
+// ---- Hardcoded users ----
+// Add/remove people here. `id` is used in URLs and as the session folder
+// name, so keep it simple (lowercase, no spaces).
+const USERS = [
+  { id: 'melissa', name: 'Melissa' },
+  { id: 'friend2', name: 'Friend 2' }
+  // { id: 'friend3', name: 'Friend 3' },
+];
 
 // Chromium writes a SingletonLock (and related Singleton* files) into its
 // profile directory while running. If the container is killed or crashes
@@ -41,95 +50,96 @@ function clearStaleChromiumLocks(rootDir) {
   }
 }
 
-clearStaleChromiumLocks(SESSION_PATH);
+clearStaleChromiumLocks(SESSION_ROOT);
 
 const app = express();
 
-// ---- In-memory state ----
-let latestQr = null;          // data URL of current QR code (null once logged in)
-let isReady = false;
-let statusText = 'Starting up...';
-const messagesByChat = new Map(); // chatId -> array of {id, from, fromName, body, timestamp, fromMe}
+// ---- Per-user state, keyed by user id ----
+// Each entry: { client, latestQr, isReady, statusText }
+const sessions = new Map();
 
-function pushMessage(chatId, msg) {
-  if (!messagesByChat.has(chatId)) messagesByChat.set(chatId, []);
-  const arr = messagesByChat.get(chatId);
-  arr.push(msg);
-  // keep last 500 per chat so memory doesn't grow unbounded
-  if (arr.length > 500) arr.shift();
+function createSessionForUser(user) {
+  const sessionPath = path.join(SESSION_ROOT, user.id);
+
+  const client = new Client({
+    authStrategy: new LocalAuth({ dataPath: sessionPath }),
+    puppeteer: {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    }
+  });
+
+  const state = {
+    client,
+    latestQr: null,
+    isReady: false,
+    statusText: 'Starting up...'
+  };
+
+  client.on('qr', async (qr) => {
+    state.statusText = 'Scan the QR code below with WhatsApp on your phone.';
+    state.latestQr = await qrcode.toDataURL(qr);
+    console.log(`[${user.id}] QR code updated. Visit /${user.id}/qr to scan it.`);
+  });
+
+  client.on('authenticated', () => {
+    state.statusText = 'Authenticated. Finishing startup...';
+    state.latestQr = null;
+  });
+
+  client.on('ready', () => {
+    state.statusText = 'Connected — syncing chats...';
+    state.latestQr = null;
+    console.log(`[${user.id}] Client ready. Waiting for store to settle...`);
+    setTimeout(() => {
+      state.isReady = true;
+      state.statusText = 'Connected.';
+      console.log(`[${user.id}] Store settle period complete.`);
+    }, 8000);
+  });
+
+  client.on('disconnected', (reason) => {
+    state.isReady = false;
+    state.statusText = `Disconnected: ${reason}. Restart the service to reconnect.`;
+    console.log(`[${user.id}] Client disconnected:`, reason);
+  });
+
+  client.initialize();
+
+  return state;
 }
 
-// ---- WhatsApp client ----
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: SESSION_PATH }),
-  puppeteer: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu'
-    ]
+for (const user of USERS) {
+  sessions.set(user.id, createSessionForUser(user));
+}
+
+function getUserOr404(req, res) {
+  const user = USERS.find((u) => u.id === req.params.userId);
+  if (!user) {
+    res.status(404).json({ error: 'Unknown user' });
+    return null;
   }
-});
-
-client.on('qr', async (qr) => {
-  statusText = 'Scan the QR code below with WhatsApp on your phone.';
-  latestQr = await qrcode.toDataURL(qr);
-  console.log('QR code updated. Visit /qr to scan it.');
-});
-
-client.on('authenticated', () => {
-  statusText = 'Authenticated. Finishing startup...';
-  latestQr = null;
-});
-
-client.on('ready', () => {
-  statusText = 'Connected — syncing chats...';
-  latestQr = null;
-  console.log('WhatsApp client is ready. Waiting for store to settle...');
-  // WhatsApp Web's internal chat/message store isn't always usable the
-  // instant 'ready' fires — calling getChats() too early can throw an
-  // opaque, minified error from inside the injected page script. Give it
-  // a short grace period before exposing the app as fully ready.
-  setTimeout(() => {
-    isReady = true;
-    statusText = 'Connected.';
-    console.log('Store settle period complete — chats should be available.');
-  }, 8000);
-});
-
-client.on('disconnected', (reason) => {
-  isReady = false;
-  statusText = `Disconnected: ${reason}. Restart the service to reconnect.`;
-  console.log('Client disconnected:', reason);
-});
-
-client.on('message_create', async (msg) => {
-  try {
-    const chat = await msg.getChat();
-    const contact = await msg.getContact();
-    pushMessage(chat.id._serialized, {
-      id: msg.id._serialized,
-      fromMe: msg.fromMe,
-      fromName: msg.fromMe ? 'You' : (contact.pushname || contact.number || 'Unknown'),
-      body: msg.body,
-      timestamp: msg.timestamp * 1000
-    });
-  } catch (err) {
-    console.error('Error handling incoming message:', err);
-  }
-});
-
-client.initialize();
+  return user;
+}
 
 async function shutdown(signal) {
-  console.log(`Received ${signal}, shutting down client...`);
-  try {
-    await client.destroy();
-  } catch (err) {
-    console.warn('Error during client.destroy():', err.message);
-  }
+  console.log(`Received ${signal}, shutting down all clients...`);
+  await Promise.all(
+    USERS.map(async (user) => {
+      const state = sessions.get(user.id);
+      if (!state) return;
+      try {
+        await state.client.destroy();
+      } catch (err) {
+        console.warn(`[${user.id}] Error during client.destroy():`, err.message);
+      }
+    })
+  );
   process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -137,37 +147,50 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 // ---- Web routes ----
 
-app.get('/qr', (req, res) => {
-  if (isReady) {
-    return res.send('<h2>Already connected. No QR code needed.</h2><p><a href="/">Go to viewer</a></p>');
+app.get('/:userId/qr', (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+  const state = sessions.get(user.id);
+
+  if (state.isReady) {
+    return res.send(
+      `<h2>${user.name} is already connected. No QR code needed.</h2><p><a href="/${user.id}">Go to viewer</a></p>`
+    );
   }
-  if (!latestQr) {
+  if (!state.latestQr) {
     return res.send('<h2>Waiting for QR code...</h2><p>Refresh in a few seconds.</p>');
   }
   res.send(`
     <html>
       <body style="font-family: sans-serif; text-align: center; padding-top: 40px;">
-        <h2>Scan with WhatsApp → Linked Devices</h2>
-        <img src="${latestQr}" alt="QR code" />
-        <p>${statusText}</p>
+        <h2>${user.name}: scan with WhatsApp → Linked Devices</h2>
+        <img src="${state.latestQr}" alt="QR code" />
+        <p>${state.statusText}</p>
       </body>
     </html>
   `);
 });
 
-app.get('/api/status', (req, res) => {
-  res.json({ ready: isReady, status: statusText, hasQr: !!latestQr });
+app.get('/api/:userId/status', (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+  const state = sessions.get(user.id);
+  res.json({ ready: state.isReady, status: state.statusText, hasQr: !!state.latestQr });
 });
 
-app.get('/api/chats', async (req, res) => {
-  if (!isReady) return res.status(503).json({ error: 'Client not ready yet' });
+app.get('/api/:userId/chats', async (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+  const state = sessions.get(user.id);
+
+  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
+
   const maxAttempts = 3;
-  let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      console.log(`Fetching chats (attempt ${attempt})...`);
-      const chats = await client.getChats();
-      console.log(`Fetched ${chats.length} chats.`);
+      console.log(`[${user.id}] Fetching chats (attempt ${attempt})...`);
+      const chats = await state.client.getChats();
+      console.log(`[${user.id}] Fetched ${chats.length} chats.`);
       return res.json(
         chats.map((c) => ({
           id: c.id._serialized,
@@ -180,8 +203,7 @@ app.get('/api/chats', async (req, res) => {
         }))
       );
     } catch (err) {
-      lastErr = err;
-      console.error(`getChats() attempt ${attempt} failed:`, err && err.stack ? err.stack : err);
+      console.error(`[${user.id}] getChats() attempt ${attempt} failed:`, err && err.stack ? err.stack : err);
       if (attempt < maxAttempts) {
         await new Promise((r) => setTimeout(r, 3000));
       }
@@ -190,12 +212,14 @@ app.get('/api/chats', async (req, res) => {
   res.status(500).json({ error: 'Chat store not ready yet — WhatsApp may still be syncing. Try again shortly.' });
 });
 
-app.get('/api/chats/:id/messages', async (req, res) => {
-  if (!isReady) return res.status(503).json({ error: 'Client not ready yet' });
-  const chatId = req.params.id;
+app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+  const state = sessions.get(user.id);
+
+  if (!state.isReady) return res.status(503).json({ error: 'Client not ready yet' });
   try {
-    // merge live-captured messages with a fresh history fetch
-    const chat = await client.getChatById(chatId);
+    const chat = await state.client.getChatById(req.params.chatId);
     const history = await chat.fetchMessages({ limit: 100 });
     const formatted = await Promise.all(
       history.map(async (msg) => {
@@ -211,17 +235,36 @@ app.get('/api/chats/:id/messages', async (req, res) => {
     );
     res.json(formatted);
   } catch (err) {
+    console.error(`[${user.id}] fetchMessages failed:`, err && err.stack ? err.stack : err);
     res.status(500).json({ error: String(err) });
   }
 });
 
+// Home page: pick which person's inbox to view
 app.get('/', (req, res) => {
+  const links = USERS.map(
+    (u) => `<li><a href="/${u.id}">${u.name}</a> — <a href="/${u.id}/qr">scan QR</a></li>`
+  ).join('');
+  res.send(`
+    <html>
+      <body style="font-family: sans-serif; padding: 40px;">
+        <h2>WhatsApp Viewer</h2>
+        <ul>${links}</ul>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/:userId', (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+
   res.send(`
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>WhatsApp Viewer</title>
+  <title>WhatsApp Viewer — ${user.name}</title>
   <style>
     body { font-family: -apple-system, sans-serif; margin: 0; display: flex; height: 100vh; }
     #sidebar { width: 280px; border-right: 1px solid #ddd; overflow-y: auto; }
@@ -234,22 +277,28 @@ app.get('/', (req, res) => {
     .msg.theirs { background: #f0f0f0; }
     .meta { font-size: 11px; color: #888; margin-top: 4px; }
     #status { padding: 8px 16px; background: #fafafa; border-bottom: 1px solid #ddd; font-size: 13px; }
+    #backlink { display: block; padding: 8px 16px; font-size: 12px; }
   </style>
 </head>
 <body>
-  <div id="sidebar"><div id="chatList">Loading chats...</div></div>
+  <div id="sidebar">
+    <a id="backlink" href="/">&larr; All users</a>
+    <div id="chatList">Loading chats...</div>
+  </div>
   <div id="main">
     <div id="status">Checking status...</div>
     <div id="messages"><p>Select a chat to view messages.</p></div>
   </div>
   <script>
+    const userId = ${JSON.stringify(user.id)};
+
     async function checkStatus() {
-      const res = await fetch('/api/status');
+      const res = await fetch('/api/' + userId + '/status');
       const data = await res.json();
       document.getElementById('status').textContent = data.status;
       if (!data.ready) {
         if (data.hasQr) {
-          document.getElementById('status').innerHTML += ' — <a href="/qr" target="_blank">Scan QR code</a>';
+          document.getElementById('status').innerHTML += ' — <a href="/' + userId + '/qr" target="_blank">Scan QR code</a>';
         }
         setTimeout(checkStatus, 3000);
         return false;
@@ -262,7 +311,7 @@ app.get('/', (req, res) => {
       if (!ready) { setTimeout(loadChats, 3000); return; }
       const list = document.getElementById('chatList');
       try {
-        const res = await fetch('/api/chats');
+        const res = await fetch('/api/' + userId + '/chats');
         const data = await res.json();
         if (!res.ok || !Array.isArray(data)) {
           console.error('Chats fetch failed:', data);
@@ -294,7 +343,7 @@ app.get('/', (req, res) => {
     }
 
     async function loadMessages(chatId, chatName) {
-      const res = await fetch('/api/chats/' + encodeURIComponent(chatId) + '/messages');
+      const res = await fetch('/api/' + userId + '/chats/' + encodeURIComponent(chatId) + '/messages');
       const msgs = await res.json();
       const container = document.getElementById('messages');
       container.innerHTML = '<h3>' + chatName + '</h3>';
@@ -317,4 +366,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
+  console.log('Users configured:', USERS.map((u) => u.id).join(', '));
 });
