@@ -883,39 +883,83 @@ app.get('/:userId', async (req, res) => {
 // Sessions live at <SESSION_ROOT>/<id>, so folding an id in the database
 // has to move the matching directory or the inbox comes up unlinked and
 // asks for a fresh QR scan.
+
+function dirSize(dir) {
+  let total = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else {
+        try {
+          total += fs.statSync(full).size;
+        } catch {
+          /* vanished mid-walk; it does not count either way */
+        }
+      }
+    }
+  }
+  return total;
+}
+
+// Both directories can exist: the capitalised one holds the session that was
+// really linked, while the lowercase one holds whatever Chromium wrote when
+// the duplicate inbox started up unlinked. A linked, synced session carries
+// its message store and is dramatically larger, so size is a good proxy for
+// "this is the real one". Nothing is ever deleted — the loser is moved
+// aside, so a wrong guess is recoverable by hand.
 function renameSessionDir(from, to) {
   const fromPath = path.join(SESSION_ROOT, from);
   const toPath = path.join(SESSION_ROOT, to);
 
   if (!fs.existsSync(fromPath)) return;
-  if (fs.existsSync(toPath)) {
-    // Something is already there. Only replace it if it holds no session.
-    let entries = [];
+
+  if (!fs.existsSync(toPath)) {
     try {
-      entries = fs.readdirSync(toPath);
-    } catch {
-      return;
-    }
-    if (entries.length > 0) {
-      console.warn(
-        `Not moving ${fromPath} onto ${toPath}: both exist and the target is not empty. ` +
-          'The linked session may need re-scanning.'
-      );
-      return;
-    }
-    try {
-      fs.rmSync(toPath, { recursive: true, force: true });
+      fs.renameSync(fromPath, toPath);
+      console.log(`Moved session directory ${from} -> ${to}.`);
     } catch (err) {
-      console.warn(`Could not clear ${toPath}:`, err.message);
-      return;
+      console.warn(`Could not move ${fromPath} to ${toPath}:`, err.message);
     }
+    return;
   }
 
+  const fromSize = dirSize(fromPath);
+  const toSize = dirSize(toPath);
+
+  if (toSize >= fromSize) {
+    const parked = `${from}.superseded-${Date.now()}`;
+    try {
+      fs.renameSync(fromPath, path.join(SESSION_ROOT, parked));
+      console.log(
+        `Kept the existing ${to} session (${toSize} bytes) over ${from} ` +
+          `(${fromSize} bytes); the old one is parked at ${parked}.`
+      );
+    } catch (err) {
+      console.warn(`Could not park ${fromPath}:`, err.message);
+    }
+    return;
+  }
+
+  const parked = `${to}.superseded-${Date.now()}`;
   try {
+    fs.renameSync(toPath, path.join(SESSION_ROOT, parked));
     fs.renameSync(fromPath, toPath);
-    console.log(`Moved session directory ${from} -> ${to}.`);
+    console.log(
+      `Moved session directory ${from} -> ${to} (${fromSize} bytes beat ` +
+        `${toSize}); the displaced one is parked at ${parked}.`
+    );
   } catch (err) {
-    console.warn(`Could not move ${fromPath} to ${toPath}:`, err.message);
+    console.warn(`Could not swap ${fromPath} into ${toPath}:`, err.message);
   }
 }
 
