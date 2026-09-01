@@ -199,6 +199,12 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 - Inboxes start 8 seconds apart rather than all at once, because several
   Chromium instances launching together starve each other into exactly that
   timeout. The last inbox is therefore ready a little after the first.
+- **`MAX_ACTIVE_INBOXES`** caps how many run a browser at once (unset = all).
+  Starvation does not fail cleanly: pages freeze, the QR stops rotating —
+  watch the `(#1, #2, #3…)` counter in the logs, a code that never reaches #2
+  is a frozen page — injection times out, and scans silently do nothing.
+  Setting this to 1 is also the quickest way to tell a memory problem from a
+  WhatsApp one: if a single inbox links fine and three do not, it is memory.
 - A client that fails to start is retried five times with backoff, and the
   failure is confined to that one inbox — the server keeps serving the
   others rather than exiting.

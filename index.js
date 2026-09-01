@@ -138,13 +138,35 @@ function buildClient(user, state) {
     state.statusText = 'Scan the QR code below with WhatsApp on your phone.';
     state.sawQrThisRun = true;
     state.startupError = null;
+
+    // The QR is the earliest point where the page has loaded enough to ask
+    // what it is. A client stuck here never reaches 'ready', so reporting
+    // only there told us nothing in exactly the case we needed it.
+    if (!state.loggedEnvironment) {
+      state.loggedEnvironment = true;
+      Promise.all([
+        client.getWWebVersion().catch((e) => `unknown (${e.message})`),
+        client.pupBrowser && client.pupBrowser.version
+          ? client.pupBrowser.version().catch(() => 'unknown')
+          : Promise.resolve('unknown')
+      ])
+        .then(([web, browser]) => {
+          console.log(`[${user.id}] WhatsApp Web build ${web} via ${browser}`);
+        })
+        .catch(() => {});
+    }
+
+    // Log every rotation. WhatsApp reissues the code every 20s or so, and a
+    // page that stops rotating has frozen — which looks identical to a
+    // working one in a screenshot, but no scan will ever succeed against it.
+    state.qrCount = (state.qrCount || 0) + 1;
     try {
       state.latestQr = await qrcode.toDataURL(qr);
     } catch (err) {
       console.error(`[${user.id}] Could not render QR code:`, err.message);
       return;
     }
-    console.log(`[${user.id}] QR code updated. Visit /${user.id}/qr to scan it.`);
+    console.log(`[${user.id}] QR code updated (#${state.qrCount}). Visit /${user.id}/qr to scan it.`);
   });
 
   client.on('authenticated', () => {
@@ -317,6 +339,27 @@ async function startSession(user, state) {
       );
     }, delay);
   }
+}
+
+// An inbox held back by MAX_ACTIVE_INBOXES: no browser, no retries, and a
+// status that explains itself.
+function dormantSession() {
+  return {
+    client: null,
+    latestQr: null,
+    isReady: false,
+    statusText:
+      'Not started — this server is set to run fewer inboxes at once (MAX_ACTIVE_INBOXES).',
+    sawQrThisRun: false,
+    claimCodePlain: null,
+    codeVisibleUntil: 0,
+    startupError: null,
+    attempts: 0,
+    needsRelink: false,
+    restarting: false,
+    settleTimer: null,
+    dormant: true
+  };
 }
 
 // `startAfterMs` staggers the launches. Starting every Chromium at the same
@@ -1082,6 +1125,14 @@ function renameSessionDir(from, to) {
 // Launching every Chromium at once is what starves them into timing out.
 const STARTUP_STAGGER_MS = 8000;
 
+// How many inboxes may run a browser at the same time. Each one costs a
+// headless Chromium, and on a container too small for all of them the
+// symptom is not a clean error: pages freeze, QR codes stop rotating, and
+// injection times out — so nothing links and nothing says why. Setting this
+// below the number of inboxes keeps the ones that do run healthy.
+// Unset means all of them, which is the old behaviour.
+const MAX_ACTIVE_INBOXES = Number(process.env.MAX_ACTIVE_INBOXES) || 0;
+
 async function start() {
   if (db.isConfigured) {
     try {
@@ -1123,8 +1174,17 @@ async function start() {
     USERS = USERS.filter((u) => isSafeInboxId(u.id));
   }
 
+  const activeLimit = MAX_ACTIVE_INBOXES > 0 ? MAX_ACTIVE_INBOXES : USERS.length;
+
   USERS.forEach((user, i) => {
-    sessions.set(user.id, createSessionForUser(user, i * STARTUP_STAGGER_MS));
+    if (i < activeLimit) {
+      sessions.set(user.id, createSessionForUser(user, i * STARTUP_STAGGER_MS));
+      return;
+    }
+    // Held back by MAX_ACTIVE_INBOXES. Give it a state object anyway so its
+    // pages render and say so, rather than 404ing or looking like a hang.
+    sessions.set(user.id, dormantSession());
+    console.log(`[${user.id}] Not started: MAX_ACTIVE_INBOXES is ${activeLimit}.`);
   });
 
   app.listen(PORT, () => {
@@ -1138,6 +1198,9 @@ async function start() {
         `Starting them ${STARTUP_STAGGER_MS / 1000}s apart; the last one is ready in about ` +
           `${Math.round(((USERS.length - 1) * STARTUP_STAGGER_MS) / 1000)}s.`
       );
+    }
+    if (activeLimit < USERS.length) {
+      console.log(`Running only ${activeLimit} of ${USERS.length} inboxes (MAX_ACTIVE_INBOXES).`);
     }
     if (INVITE_CODE) console.log('New inboxes require the invite code.');
   });

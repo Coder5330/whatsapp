@@ -909,13 +909,16 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
   if (!state.latestQr) {
     // A startup failure used to look exactly like "still starting" — the
     // same spinner, forever. Say which one it is.
-    const failed = !!state.startupError;
-    const relinking = !failed && !!state.needsRelink;
-    const heading = failed
-      ? 'WhatsApp did not start'
-      : relinking
-        ? 'WhatsApp signed this device out'
-        : 'Generating QR code…';
+    const dormant = !!state.dormant;
+    const failed = !dormant && !!state.startupError;
+    const relinking = !dormant && !failed && !!state.needsRelink;
+    const heading = dormant
+      ? 'This inbox is not running'
+      : failed
+        ? 'WhatsApp did not start'
+        : relinking
+          ? 'WhatsApp signed this device out'
+          : 'Generating QR code…';
     return page({
       title: failed
         ? `Startup trouble — ${user.name}`
@@ -925,11 +928,18 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
       body: `
 <div class="centered">
   <div class="card">
-    ${failed ? `<div class="logo">${LOCK_ICON}</div>` : '<div class="spinner"></div>'}
+    ${failed || dormant ? `<div class="logo">${LOCK_ICON}</div>` : '<div class="spinner"></div>'}
     <h1>${heading}</h1>
     <p class="sub">${escapeHtml(state.statusText)}</p>
     ${
-      failed
+      dormant
+        ? `<p class="hint">
+             The server is configured to run fewer inboxes at once than it has
+             (<code>MAX_ACTIVE_INBOXES</code>), because each one costs a
+             headless browser. Raise that limit, or give the service more
+             memory, to bring this inbox up.
+           </p>`
+        : failed
         ? `<div class="alert">${escapeHtml(state.startupError)}</div>
            <p class="hint">
              This usually means the server ran short of memory while starting
@@ -949,7 +959,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     }
   </div>
 </div>
-<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : 4000});</script>`
+${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : 4000});</script>`}`
     });
   }
 
