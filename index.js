@@ -114,8 +114,9 @@ function buildClient(user, state) {
     // account links fine in a real browser.
     //
     // 'none' resolves to no cached content, which leaves the real request
-    // alone and loads whatever WhatsApp is serving today.
-    webVersionCache: { type: 'none' },
+    // alone and loads whatever WhatsApp is serving today. WHATSAPP_WEB_VERSION
+    // swaps this for a pinned build instead.
+    ...webVersionOptions,
     puppeteer: {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
@@ -1200,6 +1201,27 @@ const STARTUP_STAGGER_MS = 8000;
 // session is dead but the app cannot tell — after unpairing the device from
 // the phone, say — because there is otherwise no way to clear one without
 // shell access to the volume. Set it, deploy once, then remove it.
+// whatsapp-web.js works by injecting into WhatsApp Web's own page, so it is
+// tied to that page's internals and a WhatsApp update can break it. The
+// library ships the build it was developed against (see DefaultOptions.
+// webVersion) for exactly that reason.
+//
+// Unset, we load whatever WhatsApp serves today. Set WHATSAPP_WEB_VERSION to
+// pin a specific build instead, fetched from the wa-version archive — worth
+// trying when pairing completes on the phone but never signs in here, which
+// is what a version mismatch looks like.
+const WHATSAPP_WEB_VERSION = (process.env.WHATSAPP_WEB_VERSION || '').trim();
+const WHATSAPP_WEB_VERSION_PATH =
+  process.env.WHATSAPP_WEB_VERSION_PATH ||
+  'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
+
+const webVersionOptions = WHATSAPP_WEB_VERSION
+  ? {
+      webVersion: WHATSAPP_WEB_VERSION,
+      webVersionCache: { type: 'remote', remotePath: WHATSAPP_WEB_VERSION_PATH }
+    }
+  : { webVersionCache: { type: 'none' } };
+
 const RESET_SESSIONS = (process.env.RESET_SESSIONS || '')
   .split(',')
   .map((v) => v.trim().toLowerCase())
@@ -1224,10 +1246,17 @@ function applySessionResets(users) {
 // How many inboxes may run a browser at the same time. Each one costs a
 // headless Chromium, and on a container too small for all of them the
 // symptom is not a clean error: pages freeze, QR codes stop rotating, and
-// injection times out — so nothing links and nothing says why. Setting this
-// below the number of inboxes keeps the ones that do run healthy.
-// Unset means all of them, which is the old behaviour.
-const MAX_ACTIVE_INBOXES = Number(process.env.MAX_ACTIVE_INBOXES) || 0;
+// injection times out — so nothing links and nothing says why.
+//
+// Unset means all of them. 0 means none: no browsers, no QR codes, no
+// pairing attempts. That matters because WhatsApp limits how often an
+// account may link a device, and an app that keeps showing codes keeps
+// spending that allowance whether or not anyone is watching.
+const rawMaxActive = process.env.MAX_ACTIVE_INBOXES;
+const MAX_ACTIVE_INBOXES =
+  rawMaxActive === undefined || rawMaxActive.trim() === ''
+    ? null
+    : Math.max(0, Number(rawMaxActive) || 0);
 
 async function start() {
   if (db.isConfigured) {
@@ -1272,7 +1301,14 @@ async function start() {
 
   applySessionResets(USERS);
 
-  const activeLimit = MAX_ACTIVE_INBOXES > 0 ? MAX_ACTIVE_INBOXES : USERS.length;
+  const activeLimit = MAX_ACTIVE_INBOXES === null ? USERS.length : MAX_ACTIVE_INBOXES;
+
+  if (activeLimit === 0) {
+    console.warn(
+      'MAX_ACTIVE_INBOXES=0 — paused. No browsers are started and no QR codes are ' +
+        'generated, so nothing consumes WhatsApp linking attempts. The web UI still runs.'
+    );
+  }
 
   USERS.forEach((user, i) => {
     if (i < activeLimit) {
@@ -1299,6 +1335,9 @@ async function start() {
     }
     if (activeLimit < USERS.length) {
       console.log(`Running only ${activeLimit} of ${USERS.length} inboxes (MAX_ACTIVE_INBOXES).`);
+    }
+    if (WHATSAPP_WEB_VERSION) {
+      console.log(`Pinned to WhatsApp Web build ${WHATSAPP_WEB_VERSION}.`);
     }
     if (INVITE_CODE) console.log('New inboxes require the invite code.');
   });

@@ -213,6 +213,17 @@ Session data is stored under `./data/sessions/<id>/` locally (or wherever
 - Inboxes start 8 seconds apart rather than all at once, because several
   Chromium instances launching together starve each other into exactly that
   timeout. The last inbox is therefore ready a little after the first.
+- **`MAX_ACTIVE_INBOXES=0`** pauses linking entirely: no browsers, no QR
+  codes, no pairing attempts, while the web UI keeps running. WhatsApp limits
+  how often an account may link a device, and an app left showing codes
+  spends that allowance whether or not anyone is watching — so pause it
+  rather than letting it retry while you work out what is wrong.
+- **`WHATSAPP_WEB_VERSION`** pins WhatsApp Web to a specific build, fetched
+  from the wa-version archive, instead of using whatever WhatsApp serves
+  today. `whatsapp-web.js` injects into WhatsApp Web's own page, so a
+  WhatsApp update can break it; the library records the build it was
+  developed against in `DefaultOptions.webVersion`, and pinning to that is
+  worth trying when pairing completes on the phone but never signs in here.
 - **`MAX_ACTIVE_INBOXES`** caps how many run a browser at once (unset = all).
   Starvation does not fail cleanly: pages freeze, the QR stops rotating —
   watch the `(#1, #2, #3…)` counter in the logs, a code that never reaches #2
