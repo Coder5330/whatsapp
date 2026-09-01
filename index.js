@@ -119,18 +119,19 @@ function buildClient(user, state) {
     ...webVersionOptions,
     puppeteer: {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      // Exactly the flags this app ran with when linking worked. Six more
+      // were added here once to trim memory, on no evidence that they
+      // helped, and linking stopped working in the same commit:
+      // --no-zygote in particular disables the process Chromium forks
+      // renderers from, and a renderer dying mid-pairing surfaces as
+      // "Target closed", "detached Frame", and a LOGOUT that looks for all
+      // the world like WhatsApp rejecting the device. Do not add to this
+      // list without a measurement showing it is needed.
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        // Trim what each instance costs; several run side by side.
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--no-first-run',
-        '--no-zygote'
+        '--disable-gpu'
       ]
     }
   });
