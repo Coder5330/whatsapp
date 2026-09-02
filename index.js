@@ -465,6 +465,59 @@ app.get('/:userId/qr', async (req, res) => {
   );
 });
 
+// ---- Unlink ----
+// Pressed by a person who can see that WhatsApp has dropped the link, when
+// the app has not worked it out for itself. It does exactly what it says
+// and nothing conditional: stop the socket, set the stored session aside,
+// forget the stored chats, start again on a fresh QR code. No detection, no
+// guessing at whether it was really necessary.
+app.post('/:userId/unlink', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  // Same gate as the QR page itself: once an inbox has a password, only its
+  // owner may do this. An unclaimed inbox has no password to check and its
+  // QR page is already open to whoever reaches it.
+  if (isClaimed(cred) && !auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(
+      `/${encodeURIComponent(user.id)}/login?next=` + encodeURIComponent(`/${user.id}/qr`)
+    );
+  }
+
+  console.log(`[${user.id}] Unlink pressed. Clearing the session and starting over.`);
+
+  const previous = sessions.get(user.id);
+  if (previous && previous.stop) {
+    try {
+      await previous.stop();
+    } catch (err) {
+      console.warn(`[${user.id}] Could not stop the old connection cleanly:`, err.message);
+    }
+  }
+
+  parkDeadSession(user.id);
+
+  try {
+    await db.clearInboxHistory(user.id);
+  } catch (err) {
+    console.warn(`[${user.id}] Could not clear stored history:`, err.message);
+  }
+
+  // A brand new connection object, so none of the old run's state — failed
+  // pairings, retry counts, a stale QR — carries over. An inbox held back by
+  // MAX_ACTIVE_INBOXES stays held back: clearing its session must not be a
+  // way to start a connection the operator has capped.
+  if (previous && previous.dormant) {
+    sessions.set(user.id, dormantSession());
+    console.log(`[${user.id}] Session cleared, but the inbox stays paused (MAX_ACTIVE_INBOXES).`);
+  } else {
+    sessions.set(user.id, createSessionForUser(user));
+  }
+
+  res.redirect(`/${encodeURIComponent(user.id)}/qr`);
+});
+
 // ---- Change password ----
 
 app.get('/:userId/password', async (req, res) => {
@@ -689,6 +742,40 @@ app.get('/:userId', async (req, res) => {
   }
   res.send(views.viewerPage(user));
 });
+
+// Move an inbox's stored WhatsApp session aside so the next connection
+// starts from a fresh QR code. Moved, not deleted: if the wrong one is
+// cleared it can still be put back by hand off the volume. One previous
+// copy is kept so the disk cannot fill with them.
+//
+// This was called by RESET_SESSIONS but never actually written, so setting
+// that variable crashed the boot with a ReferenceError before the server
+// ever listened.
+function parkDeadSession(userId) {
+  const dir = path.join(SESSION_ROOT, userId);
+  if (!fs.existsSync(dir)) return false;
+
+  const parked = `${dir}.unlinked-${Date.now()}`;
+  try {
+    fs.renameSync(dir, parked);
+  } catch (err) {
+    console.warn(`[${userId}] Could not set the session aside:`, err.message);
+    return false;
+  }
+
+  try {
+    const stale = fs
+      .readdirSync(SESSION_ROOT)
+      .filter((n) => n.startsWith(`${userId}.unlinked-`))
+      .sort();
+    for (const name of stale.slice(0, -1)) {
+      fs.rmSync(path.join(SESSION_ROOT, name), { recursive: true, force: true });
+    }
+  } catch {
+    /* pruning is best effort */
+  }
+  return true;
+}
 
 // Sessions live at <SESSION_ROOT>/<id>, so folding an id in the database
 // has to move the matching directory or the inbox comes up unlinked and

@@ -150,6 +150,24 @@ button {
 button:hover { opacity: .9; }
 button:active { transform: translateY(1px); }
 
+/* Unlink throws the stored session away, so it is deliberately not the
+   button your eye lands on first. */
+.unlink {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.unlink button {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 9px 14px;
+  font-size: 14px;
+}
+
+.unlink .hint { margin-top: 10px; }
+
 .alert {
   background: var(--danger-soft);
   color: var(--danger);
@@ -869,6 +887,26 @@ function homePage(entries, capacity = { max: 0, used: 0, needsInvite: false, err
 // claimCode is passed only when this server watched the QR get scanned in
 // this process — never for a session restored from disk, where the QR page
 // is reachable by anyone who has not claimed it yet.
+// The manual way out. Shown on every state of this page, because the whole
+// point is that it works when the app's own idea of the link is wrong.
+function unlinkForm(user) {
+  const id = escapeHtml(user.id);
+  return `
+    <div class="unlink">
+      <form method="post" action="/${id}/unlink"
+            onsubmit="return confirm('Unlink ${escapeHtml(user.name)}?\n\nThe saved WhatsApp session and the stored chats are cleared, and a new QR code is generated to scan.');">
+        <button type="submit">Unlink and start over</button>
+      </form>
+      <p class="hint">
+        Press this when WhatsApp has dropped the link but this page has not
+        noticed — for example if the device is gone from
+        <strong>WhatsApp &rarr; Linked Devices</strong> but the inbox still
+        claims to be connected. It clears the saved session and the stored
+        chats, then shows a fresh QR code. The inbox password is unchanged.
+      </p>
+    </div>`;
+}
+
 function qrPage({ user, state, claimCode = null, needsSetup = false }) {
   const name = escapeHtml(user.name);
   const id = encodeURIComponent(user.id);
@@ -911,6 +949,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
            <a href="/${id}/setup"><button type="button">I have a setup code</button></a>`
         : `<a href="/${id}"><button type="button">Open inbox</button></a>`
     }
+    ${unlinkForm(user)}
   </div>
 </div>`
     });
@@ -992,6 +1031,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
                 : ''
             }<span class="pill">This page refreshes automatically</span>`
     }
+    ${dormant ? '' : unlinkForm(user)}
   </div>
 </div>
 ${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${failed ? 15000 : linking ? 2500 : 4000});</script>`}`
@@ -1018,6 +1058,7 @@ ${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${faile
           : 'Codes expire after a while — this page refreshes itself.'
       }
     </p>
+    ${unlinkForm(user)}
   </div>
 </div>
 <script>setTimeout(function () { location.reload(); }, 6000);</script>`
@@ -1041,6 +1082,8 @@ function viewerPage(user) {
         <a class="back" href="/">&larr; All inboxes</a>
         &middot;
         <a class="back" href="/${encodeURIComponent(user.id)}/password">Password</a>
+        &middot;
+        <a class="back" href="/${encodeURIComponent(user.id)}/qr">Link</a>
       </div>
       <form method="POST" action="/${encodeURIComponent(user.id)}/logout">
         <button class="linkbtn" type="submit">Sign out</button>
