@@ -974,7 +974,9 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
           : relinking
             ? 'WhatsApp signed this device out'
             : struggling
-              ? 'Reconnecting to WhatsApp'
+              ? state.diskFull
+                ? 'The server is out of disk space'
+                : 'Reconnecting to WhatsApp'
               : 'Generating QR code…';
     return page({
       title: failed
@@ -1021,13 +1023,30 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
           : `${
               struggling
                 ? `<div class="alert">${escapeHtml(state.retryNotice)}</div>
-                   <p class="hint">
-                     The connection to WhatsApp keeps dropping — usually a
-                     network blip at one end or the other. This inbox keeps
-                     retrying by itself and picks up where it left off as soon
-                     as WhatsApp is reachable again, so there is nothing to
-                     restart.
-                   </p>`
+                   ${
+                     state.diskFull
+                       ? `<p class="hint">
+                            This is a problem with the server, not with
+                            WhatsApp. The disk holding the WhatsApp sessions
+                            is full, so this inbox cannot save the session it
+                            needs to stay linked. Someone has to free space or
+                            make the volume bigger; the inbox retries on its
+                            own and comes straight back once there is room.
+                          </p>`
+                       : state.retryKind === 'start'
+                         ? `<p class="hint">
+                              This inbox could not start. It keeps retrying by
+                              itself and comes back as soon as whatever is in
+                              the way clears.
+                            </p>`
+                         : `<p class="hint">
+                              The connection to WhatsApp keeps dropping —
+                              usually a network blip at one end or the other.
+                              This inbox keeps retrying by itself and picks up
+                              where it left off as soon as WhatsApp is
+                              reachable again, so there is nothing to restart.
+                            </p>`
+                   }`
                 : ''
             }<span class="pill">This page refreshes automatically</span>`
     }

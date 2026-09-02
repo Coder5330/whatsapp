@@ -191,6 +191,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     // failing. Distinct from `startupError`, which means this inbox has
     // stopped trying and needs a person.
     retryNotice: null,
+    // Which kind of trouble the notice is about: a socket that keeps
+    // dropping reads very differently from a process that cannot write to
+    // its own volume, and saying "probably a network blip" under an ENOSPC
+    // sends someone looking in the wrong place entirely.
+    retryKind: null,
+    diskFull: false,
     socket: null,
     contactNames: new Map(),
     dormant: false
@@ -477,6 +483,8 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.pairingFailures = 0;
       state.attempts = 0;
       state.retryNotice = null;
+      state.retryKind = null;
+      state.diskFull = false;
       state.isReady = true;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Connected. Syncing history in the background.`);
@@ -575,6 +583,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     state.statusText = `Disconnected (${reason}). Reconnecting in ${seconds}s...`;
 
     if (state.attempts >= RETRY_NOISY_AFTER) {
+      state.retryKind = 'drop';
       state.retryNotice = `Could not stay connected (${reason}) — ${state.attempts} attempts so far.`;
       console.warn(
         `[${user.id}] Disconnected (${reason}) on attempt ${state.attempts}. ` +
@@ -662,8 +671,25 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // the handshake — all clear on their own, so this keeps trying too.
       const delay = backoffFor(state.attempts);
       const seconds = Math.max(1, Math.round(delay / 1000));
-      state.retryNotice = state.attempts >= RETRY_NOISY_AFTER ? `WhatsApp did not start: ${message}` : null;
-      state.statusText = `Did not start. Retrying in ${seconds}s...`;
+      // ENOSPC is not a WhatsApp problem and never clears by itself. It
+      // still retries — the moment space is freed the inbox comes back with
+      // no redeploy — but it must say what is actually wrong.
+      state.diskFull = err && err.code === 'ENOSPC';
+      state.retryKind = 'start';
+      state.retryNotice = state.diskFull
+        ? `The server has run out of disk space, so this inbox cannot store its WhatsApp session (${message}).`
+        : state.attempts >= RETRY_NOISY_AFTER
+          ? `WhatsApp did not start: ${message}`
+          : null;
+      if (state.diskFull) {
+        console.error(
+          `[${user.id}] Out of disk space on the session volume. ` +
+            'Free space or grow the volume; this inbox retries until then.'
+        );
+      }
+      state.statusText = state.diskFull
+        ? `Out of disk space. Retrying in ${seconds}s...`
+        : `Did not start. Retrying in ${seconds}s...`;
       scheduleReconnect(delay);
     }
   }

@@ -777,6 +777,105 @@ function parkDeadSession(userId) {
   return true;
 }
 
+// Every parked copy — .loggedout-, .unlinked-, .superseded- — is a full
+// duplicate of a Baileys auth directory, and one of those is thousands of
+// small key files. Each prefix used to prune only its own kind, and
+// .superseded- was never pruned at all, so they piled up on a volume that
+// has no shell to clean them from. That is how /data fills.
+//
+// One sweep at boot, over all three: keep the newest copy per inbox as the
+// recovery copy the parking is for, delete the rest, and delete even the
+// newest once it is older than this.
+const PARKED_PREFIXES = ['.loggedout-', '.unlinked-', '.superseded-'];
+const PARKED_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+
+function isParkedName(name) {
+  return PARKED_PREFIXES.some((p) => name.includes(p));
+}
+
+// The trailing Date.now() is what a copy is dated by; a name without one is
+// treated as ancient rather than guessed at.
+function parkedStamp(name) {
+  const m = /-(\d{10,})$/.exec(name);
+  return m ? Number(m[1]) : 0;
+}
+
+function sweepParkedSessions() {
+  let names;
+  try {
+    names = fs.readdirSync(SESSION_ROOT).filter(isParkedName);
+  } catch {
+    return; // no session root yet, nothing parked
+  }
+  if (!names.length) return;
+
+  // Newest first, so the first one seen for an inbox is the keeper.
+  names.sort((a, b) => parkedStamp(b) - parkedStamp(a));
+
+  const kept = new Set();
+  const cutoff = Date.now() - PARKED_KEEP_MS;
+  let removed = 0;
+  let freed = 0;
+
+  for (const name of names) {
+    const inbox = name.split('.')[0];
+    const full = path.join(SESSION_ROOT, name);
+    const stamp = parkedStamp(name);
+    const keep = !kept.has(inbox) && stamp >= cutoff;
+
+    if (keep) {
+      kept.add(inbox);
+      continue;
+    }
+    let size = 0;
+    try {
+      size = dirSize(full);
+    } catch {
+      /* size is only for the log */
+    }
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+      removed += 1;
+      freed += size;
+    } catch (err) {
+      console.warn(`Could not remove the parked session ${name}:`, err.message);
+    }
+  }
+
+  if (removed) {
+    console.log(
+      `Removed ${removed} parked session ${removed === 1 ? 'copy' : 'copies'}, ` +
+        `freeing about ${Math.round(freed / 1024 / 1024)}MB. ` +
+        `Kept ${kept.size} for recovery.`
+    );
+  }
+}
+
+// The volume filling up is not something the app can fix, but it is
+// something it can say plainly instead of failing as ENOSPC deep inside a
+// mkdir. Printed at boot and whenever a write fails for space.
+function reportDiskSpace() {
+  try {
+    const st = fs.statfsSync(SESSION_ROOT);
+    const free = st.bsize * st.bavail;
+    const total = st.bsize * st.blocks;
+    const pct = total ? Math.round((1 - free / total) * 100) : 0;
+    console.log(
+      `Session volume ${SESSION_ROOT}: ${Math.round(free / 1024 / 1024)}MB free ` +
+        `of ${Math.round(total / 1024 / 1024)}MB (${pct}% used).`
+    );
+    if (total && free / total < 0.05) {
+      console.warn(
+        'That volume is nearly full. WhatsApp sessions cannot be written and ' +
+          'inboxes will fail to start. Grow the volume in Railway, or clear it ' +
+          'with RESET_SESSIONS.'
+      );
+    }
+  } catch (err) {
+    console.warn('Could not measure the session volume:', err.message);
+  }
+}
+
 // Sessions live at <SESSION_ROOT>/<id>, so folding an id in the database
 // has to move the matching directory or the inbox comes up unlinked and
 // asks for a fresh QR scan.
@@ -969,6 +1068,11 @@ async function start() {
   }
 
   applySessionResets(USERS);
+
+  // Before anything tries to write a session, take back whatever the old
+  // parked copies are holding, and say where the volume stands.
+  sweepParkedSessions();
+  reportDiskSpace();
 
   const activeLimit = MAX_ACTIVE_INBOXES === null ? USERS.length : MAX_ACTIVE_INBOXES;
 
