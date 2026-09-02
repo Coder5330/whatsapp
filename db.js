@@ -97,10 +97,37 @@ CREATE TABLE IF NOT EXISTS wa_messages (
 CREATE INDEX IF NOT EXISTS wa_messages_thread
   ON wa_messages (inbox_id, chat_id, ts DESC);
 
+-- Who a jid belongs to. Baileys hands the address book over once, during
+-- the first history sync, and never again — so holding it in memory meant
+-- losing every name at the next restart and falling back to bare phone
+-- numbers. It belongs on disk with everything else.
+CREATE TABLE IF NOT EXISTS wa_contacts (
+  inbox_id TEXT NOT NULL,
+  jid      TEXT NOT NULL,
+  name     TEXT,
+  PRIMARY KEY (inbox_id, jid)
+);
+
 -- Earlier versions declared unread_count NOT NULL. A row derived from a
 -- message has no opinion about unread counts and passes null so it cannot
 -- reset one, which that constraint rejected.
 ALTER TABLE wa_chats ALTER COLUMN unread_count DROP NOT NULL;
+
+-- Profile pictures. WhatsApp serves them from signed URLs that expire, so
+-- the fetch time is kept too: a null url with a recent timestamp means
+-- "asked, there isn't one", which is worth remembering so it is not asked
+-- again on every sync.
+ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_checked_at BIGINT;
+
+-- An earlier version stored the chat's own number as its name. That is not
+-- a name, and because the column is COALESCEd on write it outranks the real
+-- one forever once written. Clear those rows; the number is derived from
+-- the jid at read time, so nothing is lost and the next real name sticks.
+UPDATE wa_chats
+   SET name = NULL
+ WHERE name IS NOT NULL
+   AND name = split_part(chat_id, '@', 1);
 `;
 
 async function init() {
@@ -312,6 +339,64 @@ function chunk(rows) {
   return out;
 }
 
+// contacts: [{ jid, name }]. Only rows carrying a name are worth writing —
+// a null would say nothing that the jid does not already say.
+async function upsertContacts(inboxId, contacts) {
+  const rows = contacts.filter((c) => c.jid && c.name);
+  if (!rows.length) return 0;
+
+  for (const group of chunk(rows)) {
+    const values = [];
+    const params = [];
+    group.forEach((c, i) => {
+      const b = i * 3;
+      values.push(`($${b + 1}, $${b + 2}, $${b + 3})`);
+      params.push(inboxId, c.jid, c.name);
+    });
+    await getPool().query(
+      `INSERT INTO wa_contacts (inbox_id, jid, name)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (inbox_id, jid) DO UPDATE SET
+         name = COALESCE(EXCLUDED.name, wa_contacts.name)`,
+      params
+    );
+  }
+  return rows.length;
+}
+
+// Read back at startup so a restart does not begin with every name blank.
+async function listContacts(inboxId) {
+  const { rows } = await getPool().query(
+    `SELECT jid, name FROM wa_contacts WHERE inbox_id = $1 AND name IS NOT NULL`,
+    [inboxId]
+  );
+  return rows.map((r) => ({ jid: r.jid, name: r.name }));
+}
+
+// A null url records that WhatsApp was asked and had nothing to give, which
+// stops the next sync from asking again.
+async function setChatAvatar(inboxId, chatId, url) {
+  await getPool().query(
+    `UPDATE wa_chats SET avatar_url = $3, avatar_checked_at = $4
+      WHERE inbox_id = $1 AND chat_id = $2`,
+    [inboxId, chatId, url || null, Date.now()]
+  );
+}
+
+// The chats worth asking about: most recent first, and only those never
+// checked or checked longer ago than `staleBefore`.
+async function chatsNeedingAvatar(inboxId, staleBefore, limit) {
+  const { rows } = await getPool().query(
+    `SELECT chat_id FROM wa_chats
+      WHERE inbox_id = $1
+        AND (avatar_checked_at IS NULL OR avatar_checked_at < $2)
+      ORDER BY last_ts DESC NULLS LAST
+      LIMIT $3`,
+    [inboxId, staleBefore, limit]
+  );
+  return rows.map((r) => r.chat_id);
+}
+
 // chats: [{ id, name, isGroup, unreadCount, lastTs, lastText, lastMedia }]
 async function upsertChats(inboxId, chats) {
   if (!chats.length) return;
@@ -390,16 +475,27 @@ async function upsertMessages(inboxId, messages) {
 
 async function listChats(inboxId, limit = 200) {
   const { rows } = await getPool().query(
-    `SELECT chat_id, name, is_group, unread_count, last_ts, last_text, last_media
-       FROM wa_chats
-      WHERE inbox_id = $1
-      ORDER BY last_ts DESC NULLS LAST
+    `SELECT c.chat_id, c.is_group, c.unread_count, c.last_ts, c.last_text,
+            c.last_media, c.avatar_url,
+            -- A group is named by its subject, which only the chat row has.
+            -- A person is named by the address book, which beats whatever
+            -- name they set on their own phone.
+            CASE WHEN c.is_group THEN COALESCE(c.name, ct.name)
+                 ELSE COALESCE(ct.name, c.name) END AS name
+       FROM wa_chats c
+       LEFT JOIN wa_contacts ct
+         ON ct.inbox_id = c.inbox_id AND ct.jid = c.chat_id
+      WHERE c.inbox_id = $1
+      ORDER BY c.last_ts DESC NULLS LAST
       LIMIT $2`,
     [inboxId, limit]
   );
   return rows.map((r) => ({
     id: r.chat_id,
+    // The number is the fallback, computed here rather than stored — a name
+    // written into the row would outrank the real one when it arrives.
     name: r.name || r.chat_id.split('@')[0],
+    avatarUrl: r.avatar_url || null,
     isGroup: r.is_group,
     unreadCount: r.unread_count || 0,
     lastMessage: r.last_ts
@@ -458,6 +554,7 @@ async function countChats(inboxId) {
 async function clearInboxHistory(inboxId) {
   await getPool().query('DELETE FROM wa_messages WHERE inbox_id = $1', [inboxId]);
   await getPool().query('DELETE FROM wa_chats WHERE inbox_id = $1', [inboxId]);
+  await getPool().query('DELETE FROM wa_contacts WHERE inbox_id = $1', [inboxId]);
 }
 
 async function close() {
@@ -481,6 +578,10 @@ module.exports = {
   updatePassword,
   resetInbox,
   upsertChats,
+  upsertContacts,
+  listContacts,
+  setChatAvatar,
+  chatsNeedingAvatar,
   upsertMessages,
   listChats,
   listMessages,

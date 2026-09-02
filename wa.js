@@ -19,7 +19,9 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  downloadMediaMessage
+  downloadMediaMessage,
+  jidNormalizedUser,
+  isLidUser
 } = require('baileys');
 
 const db = require('./db');
@@ -52,6 +54,28 @@ function jidOf(value) {
 
 function isGroupJid(jid) {
   return jidOf(jid).endsWith('@g.us');
+}
+
+// WhatsApp has been moving to LID addressing, where a person shows up as
+// `165257557311725@lid` instead of their phone number. A LID is not a phone
+// number and rendering it as one is how a chat ends up titled with a
+// meaningless 15-digit string. The real jid rides along on the key as
+// senderPn/participantPn, so prefer that and keep the LID only as a key to
+// look names up by.
+function realJid(jid, phoneJid) {
+  const normalized = jidOf(jid) ? jidNormalizedUser(jidOf(jid)) : '';
+  if (!isLidUser(normalized)) return normalized;
+  const pn = jidOf(phoneJid);
+  return pn ? jidNormalizedUser(pn) : normalized;
+}
+
+// The digits to show when nothing better is known. A LID has no digits
+// worth showing, so it gets nothing and the caller falls back further.
+function displayNumber(jid) {
+  const value = jidOf(jid);
+  if (!value || isLidUser(value)) return null;
+  const user = value.split('@')[0];
+  return /^[0-9]{5,}$/.test(user) ? user : null;
 }
 
 // A WhatsApp message is a union of a few dozen shapes. Reduce it to the
@@ -93,21 +117,25 @@ function describeMessage(waMessage) {
 
 function messageRow(waMessage, contactNames) {
   const key = waMessage.key || {};
-  const chatId = jidOf(key.remoteJid);
+  const chatId = realJid(key.remoteJid, key.senderPn);
   if (!chatId || !key.id) return null;
 
   const { mediaKind, body } = describeMessage(waMessage);
-  const participant = jidOf(key.participant);
-  const senderJid = participant || chatId;
+  const rawSender = jidOf(key.participant) || jidOf(key.remoteJid);
+  const senderJid = realJid(rawSender, key.participantPn || key.senderPn);
 
   return {
     id: key.id,
     chatId,
     fromMe: !!key.fromMe,
+    // pushName is the name the sender set on their own phone, and is the
+    // only name that arrives with a message. A number is a last resort and
+    // never a name — see chatRowFromMessage.
     senderName:
       waMessage.pushName ||
       contactNames.get(senderJid) ||
-      senderJid.split('@')[0] ||
+      contactNames.get(rawSender) ||
+      displayNumber(senderJid) ||
       null,
     body,
     ts: Number(waMessage.messageTimestamp) || 0,
@@ -120,11 +148,18 @@ function messageRow(waMessage, contactNames) {
 }
 
 function chatRowFromMessage(row, contactNames) {
+  // Only a real name may be written here. Storing the phone number was what
+  // made chats show up titled `6596393236`: the column is COALESCEd on write,
+  // so a number counts as a value and outranks the actual name whenever it
+  // arrives later. The number is a fine thing to *display*, and listChats
+  // derives it from the jid — it just must not be persisted as the name.
+  const known = contactNames.get(row.chatId) || null;
+  const fromPush = isGroupJid(row.chatId) || row.fromMe ? null : row.senderName;
+  const name = known || (fromPush && fromPush !== displayNumber(row.chatId) ? fromPush : null);
+
   return {
     id: row.chatId,
-    name: isGroupJid(row.chatId)
-      ? contactNames.get(row.chatId) || null
-      : contactNames.get(row.chatId) || (row.fromMe ? null : row.senderName),
+    name,
     isGroup: isGroupJid(row.chatId),
     // A message says nothing about unread counts; leave that to the chat list.
     unreadCount: null,
@@ -164,18 +199,45 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   const authDir = path.join(sessionRoot, user.id);
   const onClaimCode = options.onClaimCode || (() => {});
 
+  // Names learned this run that are not yet on disk.
+  const pendingContacts = new Map();
+
+  function learnName(jid, name) {
+    const key = jidOf(jid);
+    if (!key || !name) return;
+    // An address-book name beats a self-set pushName, and a pushName beats
+    // nothing — but never let a bare number in, or it becomes sticky.
+    if (name === displayNumber(key)) return;
+    if (state.contactNames.get(key) === name) return;
+    state.contactNames.set(key, name);
+    pendingContacts.set(key, name);
+  }
+
+  async function flushContacts() {
+    if (!pendingContacts.size) return;
+    const rows = [...pendingContacts].map(([jid, name]) => ({ jid, name }));
+    pendingContacts.clear();
+    try {
+      await db.upsertContacts(user.id, rows);
+    } catch (err) {
+      // Put them back so the next flush retries rather than losing a name.
+      for (const r of rows) pendingContacts.set(r.jid, r.name);
+      console.warn(`[${user.id}] Could not store ${rows.length} contact names:`, err.message);
+    }
+  }
+
   async function persistHistory({ chats = [], contacts = [], messages = [] }) {
     for (const contact of contacts) {
-      const jid = jidOf(contact.id);
-      const name = contact.name || contact.notify || contact.verifiedName;
-      if (jid && name) state.contactNames.set(jid, name);
+      const jid = realJid(contact.id, contact.phoneNumber);
+      learnName(jid, contact.name || contact.verifiedName || contact.notify);
     }
 
     const chatRows = chats
       .map((c) => {
-        const id = jidOf(c.id);
+        const id = realJid(c.id, c.phoneNumber);
         if (!id) return null;
-        if (c.name) state.contactNames.set(id, c.name);
+        // A group's subject arrives as the chat name; a person's does not.
+        learnName(id, c.name);
         return {
           id,
           name: c.name || state.contactNames.get(id) || null,
@@ -208,13 +270,104 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           [...newest.values()].map((row) => chatRowFromMessage(row, state.contactNames))
         );
       }
+      await flushContacts();
       if (chatRows.length || messageRows.length) {
         console.log(
           `[${user.id}] Stored ${chatRows.length} chats and ${messageRows.length} messages.`
         );
       }
+      // A group is only ever named by asking, so ask once per group seen.
+      const groups = chatRows.filter((r) => r.isGroup && !r.name).map((r) => r.id);
+      if (groups.length) resolveGroupNames(groups);
     } catch (err) {
       console.error(`[${user.id}] Could not store history:`, err.message);
+    }
+  }
+
+  // WhatsApp throttles hard on bulk metadata lookups, so everything below
+  // goes one at a time with a gap, and only for chats the viewer will
+  // actually show.
+  const LOOKUP_GAP_MS = 400;
+  const AVATAR_TTL_MS = 12 * 60 * 60 * 1000;
+  const AVATAR_BATCH = 60;
+
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  let resolvingGroups = false;
+  const groupQueue = new Set();
+
+  function resolveGroupNames(ids) {
+    for (const id of ids) groupQueue.add(id);
+    if (resolvingGroups) return;
+    resolvingGroups = true;
+
+    (async () => {
+      while (groupQueue.size) {
+        const id = groupQueue.values().next().value;
+        groupQueue.delete(id);
+        const socket = state.socket;
+        if (!socket) break;
+        try {
+          const meta = await socket.groupMetadata(id);
+          if (meta && meta.subject) {
+            learnName(id, meta.subject);
+            await db.upsertChats(user.id, [
+              { id, name: meta.subject, isGroup: true, unreadCount: null, lastTs: null,
+                lastText: null, lastMedia: null }
+            ]);
+          }
+        } catch (err) {
+          // Left the group, or WhatsApp declined. Either way there is no
+          // subject to be had; the number-free fallback stands.
+          console.warn(`[${user.id}] No subject for group ${id}:`, err.message);
+        }
+        await pause(LOOKUP_GAP_MS);
+      }
+      await flushContacts();
+      resolvingGroups = false;
+    })().catch((err) => {
+      resolvingGroups = false;
+      console.warn(`[${user.id}] Group name lookup stopped:`, err.message);
+    });
+  }
+
+  let refreshingAvatars = false;
+  let avatarTimer = null;
+
+  // Profile pictures are signed URLs that expire, so this re-asks on a long
+  // cycle. A chat with no picture is recorded as checked too, so the ones
+  // without are not asked about again every sync.
+  async function refreshAvatars() {
+    if (refreshingAvatars || !state.isReady) return;
+    refreshingAvatars = true;
+    let found = 0;
+    try {
+      const ids = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
+      for (const id of ids) {
+        const socket = state.socket;
+        if (!socket || !state.isReady) break;
+        let url = null;
+        try {
+          url = await socket.profilePictureUrl(id, 'preview');
+        } catch {
+          // No picture, or hidden by that person's privacy settings.
+          url = null;
+        }
+        try {
+          await db.setChatAvatar(user.id, id, url);
+        } catch (err) {
+          console.warn(`[${user.id}] Could not store an avatar:`, err.message);
+        }
+        if (url) found += 1;
+        await pause(LOOKUP_GAP_MS);
+      }
+      if (ids.length) {
+        console.log(`[${user.id}] Checked ${ids.length} profile pictures, found ${found}.`);
+      }
+    } catch (err) {
+      console.warn(`[${user.id}] Profile picture refresh failed:`, err.message);
+    } finally {
+      refreshingAvatars = false;
     }
   }
 
@@ -253,12 +406,27 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       persistHistory(payload);
     });
 
-    socket.ev.on('contacts.upsert', (contacts) => {
-      for (const c of contacts) {
-        const jid = jidOf(c.id);
-        const name = c.name || c.notify;
-        if (jid && name) state.contactNames.set(jid, name);
+    const onContacts = (contacts) => {
+      for (const c of contacts || []) {
+        learnName(realJid(c.id, c.phoneNumber), c.name || c.verifiedName || c.notify);
       }
+      flushContacts().catch(() => {});
+    };
+    socket.ev.on('contacts.upsert', onContacts);
+    // Renames arrive here rather than as a fresh contact.
+    socket.ev.on('contacts.update', onContacts);
+
+    // A group renamed while we were connected.
+    socket.ev.on('groups.update', (updates) => {
+      const stale = [];
+      for (const g of updates || []) {
+        const id = jidOf(g.id);
+        if (!id) continue;
+        if (g.subject) learnName(id, g.subject);
+        else stale.push(id);
+      }
+      if (stale.length) resolveGroupNames(stale);
+      flushContacts().catch(() => {});
     });
 
     socket.ev.on('chats.upsert', (chats) => persistHistory({ chats }));
@@ -313,6 +481,11 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Connected. Syncing history in the background.`);
       onClaimCode(user, state);
+      // Pictures are a nicety, so they wait until the socket has settled and
+      // never block the inbox coming up. Tracked so a socket that drops in
+      // the meantime takes the pending lookup down with it.
+      clearTimeout(avatarTimer);
+      avatarTimer = setTimeout(() => refreshAvatars(), 15000);
       return;
     }
 
@@ -423,6 +596,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   }
 
   async function teardown() {
+    clearTimeout(avatarTimer);
+    avatarTimer = null;
+    groupQueue.clear();
     const socket = state.socket;
     state.socket = null;
     if (!socket) return;
@@ -458,8 +634,23 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     }
   }
 
+  // Names learned in earlier runs. Without this a restart begins with an
+  // empty map and every chat falls back to its number until WhatsApp
+  // happens to send the address book again — which, after the first sync,
+  // it does not.
+  async function loadStoredNames() {
+    try {
+      const rows = await db.listContacts(user.id);
+      for (const r of rows) state.contactNames.set(r.jid, r.name);
+      if (rows.length) console.log(`[${user.id}] Recalled ${rows.length} contact names.`);
+    } catch (err) {
+      console.warn(`[${user.id}] Could not read stored contact names:`, err.message);
+    }
+  }
+
   async function start() {
     try {
+      if (!state.contactNames.size) await loadStoredNames();
       await connect();
       state.startupError = null;
     } catch (err) {
@@ -508,4 +699,10 @@ async function fetchMedia(rawMessage) {
   };
 }
 
-module.exports = { createInboxConnection, fetchMedia };
+module.exports = {
+  createInboxConnection,
+  fetchMedia,
+  // Exposed for tests: these are pure, and the jid shapes they handle are
+  // fiddly enough to be worth pinning down without a live socket.
+  __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid }
+};

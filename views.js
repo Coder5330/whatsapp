@@ -245,6 +245,16 @@ code {
   font-weight: 600;
   font-size: 15px;
   text-transform: uppercase;
+  overflow: hidden;
+}
+
+/* The photo covers the initials underneath, so a URL that has expired or a
+   contact who hides their picture falls back on its own with no flicker. */
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .dot {
@@ -1078,7 +1088,23 @@ function viewerPage(user) {
 
   function initialsOf(text) {
     var t = (text || '?').trim();
+    // A phone number has no useful initial, so mark it as a person instead
+    // of showing the leading digit.
+    if (/^[+0-9][0-9 ()-]*$/.test(t)) return '#';
     return t.charAt(0) || '?';
+  }
+
+  // Initials first, then the photo on top of them once it loads. An image
+  // that 404s (an expired signed URL) removes itself and the initials show.
+  function paintAvatar(el, chat) {
+    el.textContent = initialsOf(chat.name);
+    if (!chat.avatarUrl) return;
+    var img = document.createElement('img');
+    img.alt = '';
+    img.loading = 'lazy';
+    img.onerror = function () { img.remove(); };
+    img.onload = function () { el.textContent = ''; el.appendChild(img); };
+    img.src = chat.avatarUrl;
   }
 
   function shortTime(ts) {
@@ -1170,7 +1196,7 @@ function viewerPage(user) {
 
       var avatar = document.createElement('div');
       avatar.className = 'avatar';
-      avatar.textContent = initialsOf(chat.name);
+      paintAvatar(avatar, chat);
       row.appendChild(avatar);
 
       var grow = document.createElement('div');
@@ -1247,7 +1273,7 @@ function viewerPage(user) {
     renderChats();
 
     document.getElementById('chatHead').hidden = false;
-    document.getElementById('chatAvatar').textContent = initialsOf(chat.name);
+    paintAvatar(document.getElementById('chatAvatar'), chat);
     document.getElementById('chatName').textContent = chat.name;
     document.getElementById('chatSub').textContent = chat.isGroup ? 'Group chat' : 'Direct message';
 
