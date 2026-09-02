@@ -24,8 +24,25 @@ const {
 
 const db = require('./db');
 
-const MAX_START_ATTEMPTS = 5;
-const START_BASE_DELAY_MS = 5000;
+// A dropped socket is the normal case, not the exceptional one: WhatsApp
+// closes connections it considers idle, containers lose their network for a
+// moment, and the protocol itself asks for a reconnect right after pairing.
+// So there is no attempt limit — an inbox that stops trying can only be
+// revived by a redeploy, which is exactly the dead end this is here to
+// avoid. What is bounded is the rate: back off to one attempt a minute so a
+// genuinely unreachable server is not hammered.
+const RETRY_BASE_DELAY_MS = 2000;
+const RETRY_MAX_DELAY_MS = 60000;
+
+// The first couple of retries are ordinary and pass in silence. Past this
+// many in a row, the page stops showing a bare spinner and says what keeps
+// going wrong.
+const RETRY_NOISY_AFTER = 3;
+
+function backoffFor(attempts) {
+  const steps = Math.min(Math.max(0, attempts - 1), 10);
+  return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** steps);
+}
 
 // ---- Shaping what the socket reports into what the viewer stores ----
 
@@ -135,6 +152,10 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     everAuthenticated: false,
     pairingFailures: 0,
     qrCount: 0,
+    // Set once retrying stops being routine, so the page can say what keeps
+    // failing. Distinct from `startupError`, which means this inbox has
+    // stopped trying and needs a person.
+    retryNotice: null,
     socket: null,
     contactNames: new Map(),
     dormant: false
@@ -261,6 +282,10 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     if (qr) {
       state.sawQrThisRun = true;
       state.startupError = null;
+      state.retryNotice = null;
+      // A code only arrives over a working socket, so whatever backoff the
+      // earlier failures earned is stale. Start counting again from zero.
+      state.attempts = 0;
       state.qrCount += 1;
       try {
         state.latestQr = await qrcode.toDataURL(qr);
@@ -283,6 +308,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.everAuthenticated = true;
       state.pairingFailures = 0;
       state.attempts = 0;
+      state.retryNotice = null;
       state.isReady = true;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Connected. Syncing history in the background.`);
@@ -304,8 +330,26 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       String(statusCode);
 
     state.isReady = false;
-    state.authenticating = false;
     state.latestQr = null;
+
+    // WhatsApp closes the socket the moment a scan is accepted and expects
+    // to be reconnected with the credentials it just wrote. That is the last
+    // step of linking, not a failure: reconnect at once, and charge it
+    // nothing in backoff.
+    if (statusCode === DisconnectReason.restartRequired) {
+      if (state.sawQrThisRun) state.authenticating = true;
+      state.retryNotice = null;
+      state.statusText = state.authenticating
+        ? 'Scan accepted. Finishing sign-in...'
+        : 'WhatsApp asked for a reconnect. Reconnecting...';
+      console.log(`[${user.id}] ${reason}: reconnecting with the session just written.`);
+      await teardown();
+      state.attempts = 0;
+      scheduleReconnect(0);
+      return;
+    }
+
+    state.authenticating = false;
 
     // loggedOut means the credentials are dead and reconnecting with them
     // will fail identically. Everything else is worth retrying on the
@@ -346,17 +390,27 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       return;
     }
 
-    console.warn(`[${user.id}] Disconnected (${reason}). Reconnecting...`);
-    state.statusText = `Disconnected (${reason}). Reconnecting...`;
+    // Everything left is a transient network condition: connectionLost and
+    // timedOut (both 408), connectionClosed, connectionReplaced,
+    // unavailableService. None of them mean the session is bad, so none of
+    // them may end in giving up — the inbox has to come back on its own once
+    // WhatsApp is reachable again, without anyone redeploying.
     await teardown();
 
-    if (state.attempts >= MAX_START_ATTEMPTS) {
-      state.startupError = `Could not stay connected (${reason}).`;
-      state.statusText = 'Not connecting. Restart the service to try again.';
-      console.error(`[${user.id}] Giving up after ${state.attempts} attempts.`);
-      return;
+    const delay = backoffFor(state.attempts);
+    const seconds = Math.max(1, Math.round(delay / 1000));
+    state.statusText = `Disconnected (${reason}). Reconnecting in ${seconds}s...`;
+
+    if (state.attempts >= RETRY_NOISY_AFTER) {
+      state.retryNotice = `Could not stay connected (${reason}) — ${state.attempts} attempts so far.`;
+      console.warn(
+        `[${user.id}] Disconnected (${reason}) on attempt ${state.attempts}. ` +
+          `Still retrying, next in ${seconds}s.`
+      );
+    } else {
+      console.warn(`[${user.id}] Disconnected (${reason}). Reconnecting in ${seconds}s.`);
     }
-    scheduleReconnect(Math.min(60000, START_BASE_DELAY_MS * 2 ** Math.max(0, state.attempts - 1)));
+    scheduleReconnect(delay);
   }
 
   function scheduleReconnect(delay) {
@@ -411,16 +465,14 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       console.error(`[${user.id}] Start attempt ${state.attempts} failed:`, message);
-      state.startupError = message;
       await teardown();
 
-      if (state.attempts >= MAX_START_ATTEMPTS) {
-        state.statusText = 'WhatsApp did not start. Restart the service to try again.';
-        console.error(`[${user.id}] Giving up after ${state.attempts} attempts.`);
-        return;
-      }
-      const delay = Math.min(60000, START_BASE_DELAY_MS * 2 ** (state.attempts - 1));
-      state.statusText = `Did not start. Retrying in ${Math.round(delay / 1000)}s...`;
+      // The usual causes — no network yet, a full volume, WhatsApp refusing
+      // the handshake — all clear on their own, so this keeps trying too.
+      const delay = backoffFor(state.attempts);
+      const seconds = Math.max(1, Math.round(delay / 1000));
+      state.retryNotice = state.attempts >= RETRY_NOISY_AFTER ? `WhatsApp did not start: ${message}` : null;
+      state.statusText = `Did not start. Retrying in ${seconds}s...`;
       scheduleReconnect(delay);
     }
   }

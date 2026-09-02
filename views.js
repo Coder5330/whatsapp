@@ -913,6 +913,9 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     const failed = !dormant && !!state.startupError;
     const linking = !dormant && !failed && !!state.authenticating;
     const relinking = !dormant && !failed && !linking && !!state.needsRelink;
+    // Still trying, but for long enough that a bare spinner would be a lie
+    // about how well it is going.
+    const struggling = !dormant && !failed && !linking && !relinking && !!state.retryNotice;
     const heading = dormant
       ? 'This inbox is not running'
       : failed
@@ -921,13 +924,17 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
           ? 'Scan accepted — finishing sign-in'
           : relinking
             ? 'WhatsApp signed this device out'
-            : 'Generating QR code…';
+            : struggling
+              ? 'Reconnecting to WhatsApp'
+              : 'Generating QR code…';
     return page({
       title: failed
         ? `Startup trouble — ${user.name}`
         : relinking
           ? `Re-link ${user.name} — WhatsApp Viewer`
-          : `Waiting for QR — ${user.name}`,
+          : struggling
+            ? `Reconnecting — ${user.name}`
+            : `Waiting for QR — ${user.name}`,
       body: `
 <div class="centered">
   <div class="card">
@@ -938,16 +945,14 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
       dormant
         ? `<p class="hint">
              The server is configured to run fewer inboxes at once than it has
-             (<code>MAX_ACTIVE_INBOXES</code>), because each one costs a
-             headless browser. Raise that limit, or give the service more
-             memory, to bring this inbox up.
+             (<code>MAX_ACTIVE_INBOXES</code>). Raise that limit to bring this
+             inbox up.
            </p>`
         : failed
         ? `<div class="alert">${escapeHtml(state.startupError)}</div>
            <p class="hint">
-             This usually means the server ran short of memory while starting
-             the browser for this inbox. It retries on its own; if it keeps
-             failing, restart the service or run fewer inboxes.
+             This inbox has stopped trying, which only happens when linking
+             itself keeps failing. Restart the service to start over.
            </p>`
         : linking
           ? `<p class="hint">
@@ -964,7 +969,18 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
                unchanged</strong>, so there is no setup code to enter again.
              </p>
              <span class="pill">This page refreshes automatically</span>`
-          : '<span class="pill">This page refreshes automatically</span>'
+          : `${
+              struggling
+                ? `<div class="alert">${escapeHtml(state.retryNotice)}</div>
+                   <p class="hint">
+                     The connection to WhatsApp keeps dropping — usually a
+                     network blip at one end or the other. This inbox keeps
+                     retrying by itself and picks up where it left off as soon
+                     as WhatsApp is reachable again, so there is nothing to
+                     restart.
+                   </p>`
+                : ''
+            }<span class="pill">This page refreshes automatically</span>`
     }
   </div>
 </div>

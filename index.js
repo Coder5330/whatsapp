@@ -53,11 +53,6 @@ const app = express();
 // Each entry: { client, latestQr, isReady, statusText }
 const sessions = new Map();
 
-// Several Chromium instances competing for a small container will make
-// WhatsApp Web's injection step time out, so a failed start is expected
-// rather than exceptional. Retry it with backoff, and never let the
-// rejection escape: an uncaught one takes the whole server down, and then
-// nobody can reach any inbox.
 // Inboxes held back by MAX_ACTIVE_INBOXES: no connection, no retries, and
 // a status that explains itself.
 function dormantSession() {
@@ -77,13 +72,14 @@ function dormantSession() {
     everAuthenticated: false,
     pairingFailures: 0,
     qrCount: 0,
+    retryNotice: null,
     dormant: true,
     stop: async () => {}
   };
 }
 
-// `startAfterMs` staggers connections. Far less important without a browser
-// to launch, but it still spreads out the history sync that follows.
+// `startAfterMs` staggers connections. Nothing heavy is being launched any
+// more, but it still spreads out the history sync that follows.
 function createSessionForUser(user, startAfterMs = 0) {
   const state = wa.createInboxConnection(user, SESSION_ROOT, {
     onClaimCode: (u, st) => issueClaimCodeIfNeeded(u, st)
@@ -236,8 +232,9 @@ function visibleClaimCode(state) {
 
 // ---- Creating an inbox ----
 // Open by default, which is what makes the button a button. Set INVITE_CODE
-// to require a shared secret first: each inbox costs a headless Chromium, so
-// an open form on a public URL is a resource risk as well as a tidiness one.
+// to require a shared secret first: each inbox costs a live WhatsApp
+// connection and its stored history, so an open form on a public URL is a
+// resource risk as well as a tidiness one.
 const INVITE_CODE = process.env.INVITE_CODE || '';
 
 app.get('/', async (req, res) => {
@@ -552,7 +549,10 @@ app.get('/api/:userId/status', (req, res) => {
     hasQr: !!state.latestQr,
     startupError: state.startupError || null,
     needsRelink: !!state.needsRelink,
-    authenticating: !!state.authenticating
+    authenticating: !!state.authenticating,
+    // Set while the socket keeps dropping. Unlike startupError this is not a
+    // dead end: the inbox is still reconnecting on its own.
+    retrying: state.retryNotice || null
   });
 });
 
@@ -722,8 +722,8 @@ function dirSize(dir) {
 }
 
 // Both directories can exist: the capitalised one holds the session that was
-// really linked, while the lowercase one holds whatever Chromium wrote when
-// the duplicate inbox started up unlinked. A linked, synced session carries
+// really linked, while the lowercase one holds whatever the duplicate inbox
+// wrote when it started up unlinked. A linked, synced session carries
 // its message store and is dramatically larger, so size is a good proxy for
 // "this is the real one". Nothing is ever deleted — the loser is moved
 // aside, so a wrong guess is recoverable by hand.
@@ -776,7 +776,7 @@ function renameSessionDir(from, to) {
 // Print what this process is actually running with. Several rounds of
 // debugging have been spent on a deploy whose settings were not the ones
 // being discussed, so the log should answer that without anyone guessing.
-async function reportEffectiveConfig(activeLimit) {
+function reportEffectiveConfig(activeLimit) {
   console.log(
     'Config: ' +
       `inboxes=${activeLimit}/${USERS.length}` +
@@ -789,33 +789,10 @@ async function reportEffectiveConfig(activeLimit) {
     'WHATSAPP_WEB_VERSION is set but no longer does anything — it pinned a page ' +
       'build for the old browser-based client. Remove it.'
   );
-  return;
-
-  // A pinned build that is not in the archive resolves to nothing and the
-  // client quietly loads the live page instead — so claiming it is pinned
-  // would be a lie. Check, and say which it is.
-
-  try {
-    const res = await fetch(url, { method: 'GET' });
-    if (res.ok) {
-      console.log(`Pinned to WhatsApp Web build ${WHATSAPP_WEB_VERSION}.`);
-    } else {
-      console.warn(
-        `WHATSAPP_WEB_VERSION=${WHATSAPP_WEB_VERSION} is NOT in the archive ` +
-          `(HTTP ${res.status} for ${url}). The pin does nothing — the live build ` +
-          'is used instead. Unset the variable, or pick a build the archive has.'
-      );
-    }
-  } catch (err) {
-    console.warn(
-      `Could not check WHATSAPP_WEB_VERSION=${WHATSAPP_WEB_VERSION}:`,
-      err.message,
-      '- the pin may silently fall back to the live build.'
-    );
-  }
 }
 
-// Launching every Chromium at once is what starves them into timing out.
+// Connecting every inbox at once means every history sync lands at once, on
+// one Postgres and one container. Spread them out.
 const STARTUP_STAGGER_MS = 8000;
 
 // Comma-separated inbox ids (or "all") whose stored WhatsApp session should
@@ -849,12 +826,11 @@ function applySessionResets(users) {
   console.log('RESET_SESSIONS applied. Remove the variable so it does not run again next deploy.');
 }
 
-// How many inboxes may run a browser at the same time. Each one costs a
-// headless Chromium, and on a container too small for all of them the
-// symptom is not a clean error: pages freeze, QR codes stop rotating, and
-// injection times out — so nothing links and nothing says why.
+// How many inboxes may hold a WhatsApp connection at the same time. Each one
+// costs a socket, a history sync and the memory to buffer it, which is worth
+// capping on a small container.
 //
-// Unset means all of them. 0 means none: no browsers, no QR codes, no
+// Unset means all of them. 0 means none: no connections, no QR codes, no
 // pairing attempts. That matters because WhatsApp limits how often an
 // account may link a device, and an app that keeps showing codes keeps
 // spending that allowance whether or not anyone is watching.
@@ -911,7 +887,7 @@ async function start() {
 
   if (activeLimit === 0) {
     console.warn(
-      'MAX_ACTIVE_INBOXES=0 — paused. No browsers are started and no QR codes are ' +
+      'MAX_ACTIVE_INBOXES=0 — paused. No connections are started and no QR codes are ' +
         'generated, so nothing consumes WhatsApp linking attempts. The web UI still runs.'
     );
   }
@@ -933,10 +909,10 @@ async function start() {
       `Inboxes (${USERS.length}/${db.MAX_INBOXES}):`,
       USERS.map((u) => u.id).join(', ') || '(none yet)'
     );
-    if (USERS.length > 1) {
+    if (activeLimit > 1) {
       console.log(
         `Starting them ${STARTUP_STAGGER_MS / 1000}s apart; the last one is ready in about ` +
-          `${Math.round(((USERS.length - 1) * STARTUP_STAGGER_MS) / 1000)}s.`
+          `${Math.round(((activeLimit - 1) * STARTUP_STAGGER_MS) / 1000)}s.`
       );
     }
     if (activeLimit < USERS.length) {
