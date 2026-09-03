@@ -478,6 +478,15 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // far out never fires at all, so the check silently stopped happening.
   const AVATAR_FIRST_DELAY_MS = 8000;
 
+  // Baileys waits a full minute for an answer that may never come
+  // (defaultQueryTimeoutMs). Fifteen chats that do not answer is then a
+  // fifteen-minute pass that looks, from outside, exactly like a hang.
+  const AVATAR_QUERY_TIMEOUT_MS = 10000;
+
+  // And a ceiling on the pass as a whole, so it always reports what it got
+  // rather than grinding on. Whatever is left is still due next sweep.
+  const AVATAR_PASS_BUDGET_MS = 120000;
+
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   let resolvingGroups = false;
@@ -602,17 +611,22 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // internal-server-error for a group, which is where fourteen 500s came
   // from — every one of them a @g.us. A group has to be asked directly.
   async function groupPictureUrl(socket, jid) {
-    const result = await socket.query({
-      tag: 'iq',
-      attrs: { to: jid, type: 'get', xmlns: 'w:profile:picture' },
-      content: [{ tag: 'picture', attrs: { type: 'preview', query: 'url' } }]
-    });
+    const result = await socket.query(
+      {
+        tag: 'iq',
+        attrs: { to: jid, type: 'get', xmlns: 'w:profile:picture' },
+        content: [{ tag: 'picture', attrs: { type: 'preview', query: 'url' } }]
+      },
+      AVATAR_QUERY_TIMEOUT_MS
+    );
     const picture = getBinaryNodeChild(result, 'picture');
     return picture && picture.attrs ? picture.attrs.url : null;
   }
 
   function pictureUrlFor(socket, jid) {
-    return isGroupJid(jid) ? groupPictureUrl(socket, jid) : socket.profilePictureUrl(jid, 'preview');
+    return isGroupJid(jid)
+      ? groupPictureUrl(socket, jid)
+      : socket.profilePictureUrl(jid, 'preview', AVATAR_QUERY_TIMEOUT_MS);
   }
 
   async function refreshAvatars() {
@@ -640,8 +654,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     // picked straight back up by the next pass.
     const attempted = new Set();
 
+    const until = Date.now() + AVATAR_PASS_BUDGET_MS;
+    let ranOut = false;
+
     try {
       for (let pass = 0; pass < AVATAR_MAX_PASSES; pass++) {
+        if (Date.now() > until) { ranOut = true; break; }
         const batch = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
         const ids = batch.filter((id) => !attempted.has(id));
         if (!ids.length) break;
@@ -649,6 +667,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
         for (const id of ids) {
           const socket = state.socket;
           if (!socket || !state.isReady) break;
+          if (Date.now() > until) { ranOut = true; break; }
           attempted.add(id);
 
           if (!canHaveAvatar(id)) {
@@ -710,7 +729,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           if (picture) found += 1;
           await pause(LOOKUP_GAP_MS);
         }
-        if (!state.isReady) break;
+        if (!state.isReady || ranOut) break;
       }
 
       // Always say something. Twice now, profile pictures have "not worked"
@@ -735,6 +754,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           `[${user.id}] Profile pictures: settled ${checked}, downloaded ${found}` +
             (deferred ? `, ${deferred} could not be asked and will be retried` : '') +
             (exhausted ? `, ${exhausted} gave up after ${AVATAR_MAX_FAILURES} tries` : '') +
+            (ranOut ? ', out of time — the rest are still due' : '') +
             (why ? `. Reasons: ${why}.` : '.') + tally
         );
       } else {
