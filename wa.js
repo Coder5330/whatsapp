@@ -70,11 +70,35 @@ function isGroupJid(jid) {
 // meaningless 15-digit string. The real jid rides along on the key as
 // senderPn/participantPn, so prefer that and keep the LID only as a key to
 // look names up by.
-function realJid(jid, phoneJid) {
+function realJid(jid, phoneJid, lidToPn) {
   const normalized = jidOf(jid) ? jidNormalizedUser(jidOf(jid)) : '';
   if (!isLidUser(normalized)) return normalized;
+
   const pn = jidOf(phoneJid);
-  return pn ? jidNormalizedUser(pn) : normalized;
+  if (pn) return jidNormalizedUser(pn);
+
+  // The key did not carry the number this time, but an earlier one may
+  // have. Without this the same person is two chats: outgoing messages
+  // filed under their number, replies under their LID.
+  const known = lidToPn && lidToPn.get(normalized);
+  return known || normalized;
+}
+
+// Every pair a message key reveals, so a LID seen alone later can still be
+// resolved.
+function lidPairsFrom(key) {
+  const pairs = [];
+  const add = (lid, pn) => {
+    const l = jidOf(lid);
+    const p = jidOf(pn);
+    if (!l || !p || !isLidUser(l)) return;
+    pairs.push({ lid: jidNormalizedUser(l), pn: jidNormalizedUser(p) });
+  };
+  add(key.remoteJid, key.senderPn);
+  add(key.participant, key.participantPn);
+  add(key.senderLid, key.senderPn);
+  add(key.participantLid, key.participantPn);
+  return pairs;
 }
 
 // The digits to show when nothing better is known. A LID has no digits
@@ -158,14 +182,14 @@ function slimForStorage(waMessage) {
   return plain;
 }
 
-function messageRow(waMessage, contactNames) {
+function messageRow(waMessage, contactNames, lidToPn) {
   const key = waMessage.key || {};
-  const chatId = realJid(key.remoteJid, key.senderPn);
+  const chatId = realJid(key.remoteJid, key.senderPn, lidToPn);
   if (!chatId || !key.id) return null;
 
   const { mediaKind, body } = describeMessage(waMessage);
   const rawSender = jidOf(key.participant) || jidOf(key.remoteJid);
-  const senderJid = realJid(rawSender, key.participantPn || key.senderPn);
+  const senderJid = realJid(rawSender, key.participantPn || key.senderPn, lidToPn);
 
   return {
     id: key.id,
@@ -257,6 +281,45 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // Names learned this run that are not yet on disk.
   const pendingContacts = new Map();
 
+  // lid -> phone jid, loaded at startup and added to as keys reveal pairs.
+  const lidToPn = new Map();
+  const pendingLidPairs = new Map();
+
+  // A newly learned pair usually means there are already two chats for one
+  // person — what was sent filed under the number, what came back under the
+  // LID. Fold them together.
+  async function learnLidPairs(keys) {
+    const fresh = [];
+    for (const key of keys) {
+      for (const pair of lidPairsFrom(key || {})) {
+        if (lidToPn.get(pair.lid) === pair.pn) continue;
+        lidToPn.set(pair.lid, pair.pn);
+        pendingLidPairs.set(pair.lid, pair.pn);
+        fresh.push(pair);
+      }
+    }
+    if (!fresh.length) return;
+
+    const pairs = [...pendingLidPairs].map(([lid, pn]) => ({ lid, pn }));
+    pendingLidPairs.clear();
+    try {
+      await db.upsertLidMap(user.id, pairs);
+    } catch (err) {
+      for (const p of pairs) pendingLidPairs.set(p.lid, p.pn);
+      console.warn(`[${user.id}] Could not store lid mapping:`, err.message);
+    }
+
+    for (const pair of fresh) {
+      try {
+        if (await db.mergeChats(user.id, pair.lid, pair.pn)) {
+          console.log(`[${user.id}] Merged the duplicate chat ${pair.lid} into ${pair.pn}.`);
+        }
+      } catch (err) {
+        console.warn(`[${user.id}] Could not merge ${pair.lid}:`, err.message);
+      }
+    }
+  }
+
   // WhatsApp will re-deliver a message it thinks was not acknowledged, and
   // Baileys re-emits it every time — the same message can arrive many times
   // a second, and each arrival was a write to Postgres. Remember what has
@@ -329,13 +392,13 @@ function createInboxConnection(user, sessionRoot, options = {}) {
 
   async function persistHistory({ chats = [], contacts = [], messages = [] }) {
     for (const contact of contacts) {
-      const jid = realJid(contact.id, contact.phoneNumber);
+      const jid = realJid(contact.id, contact.phoneNumber, lidToPn);
       learnName(jid, contact.name || contact.verifiedName || contact.notify);
     }
 
     const chatRows = chats
       .map((c) => {
-        const id = realJid(c.id, c.phoneNumber);
+        const id = realJid(c.id, c.phoneNumber, lidToPn);
         if (!id) return null;
         // A group's subject arrives as the chat name; a person's does not.
         learnName(id, c.name);
@@ -351,8 +414,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       })
       .filter(Boolean);
 
+    // Learn who is who before shaping the rows, so a message that reveals a
+    // pair is itself filed under the number rather than the LID.
+    if (messages.length) await learnLidPairs(messages.map((m) => m && m.key));
+
     const allMessageRows = messages
-      .map((m) => messageRow(m, state.contactNames))
+      .map((m) => messageRow(m, state.contactNames, lidToPn))
       .filter(Boolean);
 
     const messageRows = allMessageRows.filter((row) => !isRepeat(row));
@@ -712,7 +779,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
 
     const onContacts = (contacts) => {
       for (const c of contacts || []) {
-        learnName(realJid(c.id, c.phoneNumber), c.name || c.verifiedName || c.notify);
+        learnName(realJid(c.id, c.phoneNumber, lidToPn), c.name || c.verifiedName || c.notify);
       }
       flushContacts().catch(() => {});
     };
@@ -986,6 +1053,24 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // it does not.
   async function loadStoredNames() {
     try {
+      const pairs = await db.listLidMap(user.id);
+      for (const p of pairs) lidToPn.set(p.lid, p.pn);
+      if (pairs.length) console.log(`[${user.id}] Recalled ${pairs.length} lid mappings.`);
+
+      // Duplicates created before a pair was known are still sitting there.
+      // Folding them is idempotent — a merge whose source no longer exists
+      // reports false — so this can simply run every boot.
+      let merged = 0;
+      for (const p of pairs) {
+        if (await db.mergeChats(user.id, p.lid, p.pn)) merged += 1;
+      }
+      if (merged) {
+        console.log(`[${user.id}] Merged ${merged} chat(s) that were split across two ids.`);
+      }
+    } catch (err) {
+      console.warn(`[${user.id}] Could not read lid mappings:`, err.message);
+    }
+    try {
       // Name every chat that has ever received a message, before reading
       // the list back — otherwise those names only appear as new messages
       // arrive, which is why they used to trickle in.
@@ -1162,5 +1247,5 @@ module.exports = {
   thumbnailOf,
   // Exposed for tests: these are pure, and the jid shapes they handle are
   // fiddly enough to be worth pinning down without a live socket.
-  __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid, slimForStorage }
+  __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid, slimForStorage, lidPairsFrom }
 };

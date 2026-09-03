@@ -134,6 +134,19 @@ ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 -- chat that never answers should not be retried forever either.
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_fail_count INTEGER NOT NULL DEFAULT 0;
 
+-- WhatsApp addresses the same person two ways: by phone number, and by an
+-- opaque "LID". A message can arrive under either, so the same conversation
+-- ends up as two chats — one holding what you sent, one holding the
+-- replies. Nothing in the protocol hands over the mapping; it is learned
+-- from message keys, which carry both when they are LID-addressed, and kept
+-- here so it survives a restart.
+CREATE TABLE IF NOT EXISTS wa_lid_map (
+  inbox_id TEXT NOT NULL,
+  lid      TEXT NOT NULL,
+  pn       TEXT NOT NULL,
+  PRIMARY KEY (inbox_id, lid)
+);
+
 -- Migrations that must happen exactly once, rather than on every boot.
 -- Without this, "re-check everything" would mean re-checking everything at
 -- every restart, which is how an account gets rate-limited by WhatsApp.
@@ -421,6 +434,108 @@ function chunk(rows) {
   return out;
 }
 
+// pairs: [{ lid, pn }], learned from message keys that carry both.
+async function upsertLidMap(inboxId, pairs) {
+  const rows = pairs.filter((p) => p.lid && p.pn && p.lid !== p.pn);
+  if (!rows.length) return 0;
+
+  for (const group of chunk(rows)) {
+    const values = [];
+    const params = [];
+    group.forEach((p, i) => {
+      const b = i * 3;
+      values.push(`($${b + 1}, $${b + 2}, $${b + 3})`);
+      params.push(inboxId, p.lid, p.pn);
+    });
+    await getPool().query(
+      `INSERT INTO wa_lid_map (inbox_id, lid, pn) VALUES ${values.join(', ')}
+       ON CONFLICT (inbox_id, lid) DO UPDATE SET pn = EXCLUDED.pn`,
+      params
+    );
+  }
+  return rows.length;
+}
+
+async function listLidMap(inboxId) {
+  const { rows } = await getPool().query(
+    'SELECT lid, pn FROM wa_lid_map WHERE inbox_id = $1',
+    [inboxId]
+  );
+  return rows;
+}
+
+// Folds one chat into another: everything said under `fromId` becomes part
+// of `toId`, and the duplicate row goes away. Used when a LID turns out to
+// be someone already known by their phone number.
+async function mergeChats(inboxId, fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return false;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: exists } = await client.query(
+      'SELECT 1 FROM wa_chats WHERE inbox_id = $1 AND chat_id = $2',
+      [inboxId, fromId]
+    );
+    if (!exists.length) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+
+    await client.query(
+      'UPDATE wa_messages SET chat_id = $3 WHERE inbox_id = $1 AND chat_id = $2',
+      [inboxId, fromId, toId]
+    );
+
+    // Keep the better half of each column rather than whichever row wins.
+    await client.query(
+      `INSERT INTO wa_chats (inbox_id, chat_id, name, is_group, unread_count,
+                             last_ts, last_text, last_media,
+                             avatar_url, avatar_bytes, avatar_mime, avatar_checked_at)
+       SELECT inbox_id, $3, name, is_group, unread_count,
+              last_ts, last_text, last_media,
+              avatar_url, avatar_bytes, avatar_mime, avatar_checked_at
+         FROM wa_chats WHERE inbox_id = $1 AND chat_id = $2
+       ON CONFLICT (inbox_id, chat_id) DO UPDATE SET
+         name         = COALESCE(wa_chats.name, EXCLUDED.name),
+         unread_count = GREATEST(COALESCE(wa_chats.unread_count, 0),
+                                 COALESCE(EXCLUDED.unread_count, 0)),
+         last_text    = CASE WHEN COALESCE(EXCLUDED.last_ts, 0) > COALESCE(wa_chats.last_ts, 0)
+                             THEN EXCLUDED.last_text ELSE wa_chats.last_text END,
+         last_media   = CASE WHEN COALESCE(EXCLUDED.last_ts, 0) > COALESCE(wa_chats.last_ts, 0)
+                             THEN EXCLUDED.last_media ELSE wa_chats.last_media END,
+         last_ts      = GREATEST(COALESCE(wa_chats.last_ts, 0), COALESCE(EXCLUDED.last_ts, 0)),
+         avatar_url   = COALESCE(wa_chats.avatar_url, EXCLUDED.avatar_url),
+         avatar_bytes = COALESCE(wa_chats.avatar_bytes, EXCLUDED.avatar_bytes),
+         avatar_mime  = COALESCE(wa_chats.avatar_mime, EXCLUDED.avatar_mime),
+         avatar_checked_at = GREATEST(COALESCE(wa_chats.avatar_checked_at, 0),
+                                      COALESCE(EXCLUDED.avatar_checked_at, 0))`,
+      [inboxId, fromId, toId]
+    );
+
+    // A name learned against the LID is still that person's name.
+    await client.query(
+      `INSERT INTO wa_contacts (inbox_id, jid, name)
+       SELECT inbox_id, $3, name FROM wa_contacts
+        WHERE inbox_id = $1 AND jid = $2 AND name IS NOT NULL
+       ON CONFLICT (inbox_id, jid) DO UPDATE
+          SET name = COALESCE(wa_contacts.name, EXCLUDED.name)`,
+      [inboxId, fromId, toId]
+    );
+
+    await client.query('DELETE FROM wa_chats WHERE inbox_id = $1 AND chat_id = $2', [inboxId, fromId]);
+    await client.query('DELETE FROM wa_contacts WHERE inbox_id = $1 AND jid = $2', [inboxId, fromId]);
+    await client.query('COMMIT');
+    return true;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.warn(`[${inboxId}] Could not merge ${fromId} into ${toId}:`, err.message);
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
 // contacts: [{ jid, name }]. Only rows carrying a name are worth writing —
 // a null would say nothing that the jid does not already say.
 async function upsertContacts(inboxId, contacts) {
@@ -704,6 +819,7 @@ async function clearInboxHistory(inboxId) {
   await getPool().query('DELETE FROM wa_messages WHERE inbox_id = $1', [inboxId]);
   await getPool().query('DELETE FROM wa_chats WHERE inbox_id = $1', [inboxId]);
   await getPool().query('DELETE FROM wa_contacts WHERE inbox_id = $1', [inboxId]);
+  await getPool().query('DELETE FROM wa_lid_map WHERE inbox_id = $1', [inboxId]);
 }
 
 async function close() {
@@ -728,6 +844,9 @@ module.exports = {
   resetInbox,
   upsertChats,
   upsertContacts,
+  upsertLidMap,
+  listLidMap,
+  mergeChats,
   backfillContactNames,
   listContacts,
   setChatAvatar,
