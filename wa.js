@@ -401,6 +401,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // blip should not be permanent, and a permanent failure should not be
   // retried forever.
   const AVATAR_MAX_FAILURES = 5;
+  // Long enough to be clear of the twenty seconds Baileys spends buffering
+  // history and running its own init queries.
+  const AVATAR_FIRST_DELAY_MS = 45000;
 
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -517,7 +520,16 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   }
 
   async function refreshAvatars() {
-    if (refreshingAvatars || !state.isReady) return;
+    // Silence here has been mistaken for a bug three times. If the pass
+    // declines to run, say so rather than leaving nothing in the log.
+    if (refreshingAvatars) {
+      console.log(`[${user.id}] Profile pictures: a check is already running.`);
+      return;
+    }
+    if (!state.isReady) {
+      console.log(`[${user.id}] Profile pictures: skipped, the connection is not up.`);
+      return;
+    }
     refreshingAvatars = true;
     let checked = 0;
     let found = 0;
@@ -778,7 +790,10 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // that is what produced fourteen 500s and four timeouts. Wait until
       // that window has closed.
       clearTimeout(avatarTimer);
-      avatarTimer = setTimeout(() => refreshAvatars(), 45000);
+      avatarTimer = setTimeout(() => refreshAvatars(), AVATAR_FIRST_DELAY_MS);
+      console.log(
+        `[${user.id}] Profile pictures: checking in ${AVATAR_FIRST_DELAY_MS / 1000}s.`
+      );
       clearInterval(avatarCycle);
       avatarCycle = setInterval(() => refreshAvatars(), AVATAR_SWEEP_MS);
       if (avatarCycle.unref) avatarCycle.unref();
