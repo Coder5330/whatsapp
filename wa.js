@@ -471,35 +471,79 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // Profile pictures are signed URLs that expire, so this re-asks on a long
   // cycle. A chat with no picture is recorded as checked too, so the ones
   // without are not asked about again every sync.
+  // WhatsApp's answers fall into two kinds, and treating them alike is what
+  // left fourteen chats permanently blank: 401/403 (their privacy settings)
+  // and 404 (no picture set) are answers — record them and stop asking. A
+  // 500, a 408, or a dropped socket is not an answer, it is a failure to
+  // ask, and recording it as "checked" means never asking again.
+  const DEFINITIVE = new Set([401, 403, 404]);
+
+  function isDefinitive(err) {
+    const code = err && (err.output?.statusCode ?? err.status);
+    return DEFINITIVE.has(Number(code));
+  }
+
+  // Neither of these can have a profile picture, and asking wastes a query
+  // and produces a confusing error.
+  function canHaveAvatar(jid) {
+    return !/@(broadcast|newsletter)$/.test(String(jid)) && jid !== 'status@broadcast';
+  }
+
   async function refreshAvatars() {
     if (refreshingAvatars || !state.isReady) return;
     refreshingAvatars = true;
     let checked = 0;
     let found = 0;
+    let deferred = 0;
     const reasons = new Map();
+    const examples = new Map();
+    // Asked about in this run, so a row left unrecorded on purpose is not
+    // picked straight back up by the next pass.
+    const attempted = new Set();
 
     try {
       for (let pass = 0; pass < AVATAR_MAX_PASSES; pass++) {
-        const ids = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
+        const batch = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
+        const ids = batch.filter((id) => !attempted.has(id));
         if (!ids.length) break;
 
         for (const id of ids) {
           const socket = state.socket;
           if (!socket || !state.isReady) break;
+          attempted.add(id);
+
+          if (!canHaveAvatar(id)) {
+            await db.setChatAvatar(user.id, id, null).catch(() => {});
+            checked += 1;
+            continue;
+          }
+
           let url = null;
           let picture = null;
+          let answered = true;
+
           try {
             url = await socket.profilePictureUrl(id, 'preview');
             // Fetch it now, while the signature on the URL is still valid.
             if (url) picture = await downloadAvatar(url);
           } catch (err) {
-            // No picture, hidden by that person's privacy settings, or a jid
-            // WhatsApp will not answer for. Counted by reason so the log
-            // says which, rather than leaving every avatar blank in silence.
-            const why = (err && (err.output?.statusCode || err.message)) || 'unknown';
-            reasons.set(String(why), (reasons.get(String(why)) || 0) + 1);
+            const code = (err && (err.output?.statusCode ?? err.status)) || null;
+            const why = String(code || (err && err.message) || 'unknown');
+            reasons.set(why, (reasons.get(why) || 0) + 1);
+            if (!examples.has(why)) examples.set(why, id);
+            // A URL that arrived but would not download is a real failure of
+            // ours, not WhatsApp's answer, so it is worth retrying too.
+            answered = url ? false : isDefinitive(err);
             url = null;
           }
+
+          if (!answered) {
+            // Leave the row untouched so a later sweep asks again.
+            deferred += 1;
+            await pause(LOOKUP_GAP_MS);
+            continue;
+          }
+
           try {
             await db.setChatAvatar(user.id, id, {
               url,
@@ -511,7 +555,6 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           }
           checked += 1;
           if (picture) found += 1;
-          else if (url) reasons.set('download-failed', (reasons.get('download-failed') || 0) + 1);
           await pause(LOOKUP_GAP_MS);
         }
         if (!state.isReady) break;
@@ -521,7 +564,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // and the log has been silent — and silence could mean the pass never
       // ran, or ran and found nothing, or had nothing left to do. Those need
       // telling apart from the outside.
-      const why = [...reasons].map(([k, n]) => `${k}×${n}`).join(', ');
+      // Name one jid per reason: whether the failures are groups, LIDs or
+      // ordinary numbers is the thing that has been impossible to tell from
+      // a bare count.
+      const why = [...reasons]
+        .map(([k, n]) => `${k}×${n} (e.g. ${examples.get(k)})`)
+        .join(', ');
       let tally = '';
       try {
         const { total, withPicture } = await db.countChatsWithAvatar(user.id);
@@ -529,10 +577,11 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       } catch {
         /* the tally is a nicety */
       }
-      if (checked) {
+      if (checked || deferred) {
         console.log(
-          `[${user.id}] Profile pictures: checked ${checked}, downloaded ${found}` +
-            (why ? `. Without one: ${why}.` : '.') + tally
+          `[${user.id}] Profile pictures: settled ${checked}, downloaded ${found}` +
+            (deferred ? `, ${deferred} could not be asked and will be retried` : '') +
+            (why ? `. Reasons: ${why}.` : '.') + tally
         );
       } else {
         console.log(
@@ -681,8 +730,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // Pictures are a nicety, so they wait until the socket has settled and
       // never block the inbox coming up. Tracked so a socket that drops in
       // the meantime takes the pending lookup down with it.
+      // Baileys spends its first twenty seconds buffering the history sync
+      // and its own init queries, and asking for pictures in the middle of
+      // that is what produced fourteen 500s and four timeouts. Wait until
+      // that window has closed.
       clearTimeout(avatarTimer);
-      avatarTimer = setTimeout(() => refreshAvatars(), 5000);
+      avatarTimer = setTimeout(() => refreshAvatars(), 45000);
       clearInterval(avatarCycle);
       avatarCycle = setInterval(() => refreshAvatars(), AVATAR_SWEEP_MS);
       if (avatarCycle.unref) avatarCycle.unref();
@@ -927,6 +980,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
 
   state.start = start;
   state.stop = teardown;
+  // Exposed so the picture pass can be driven directly, in tests and if it
+  // ever needs triggering by hand.
+  state.refreshAvatars = refreshAvatars;
   return state;
 }
 
