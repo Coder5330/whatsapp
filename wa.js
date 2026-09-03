@@ -509,11 +509,26 @@ function createInboxConnection(user, sessionRoot, options = {}) {
         if (!state.isReady) break;
       }
 
+      // Always say something. Twice now, profile pictures have "not worked"
+      // and the log has been silent — and silence could mean the pass never
+      // ran, or ran and found nothing, or had nothing left to do. Those need
+      // telling apart from the outside.
+      const why = [...reasons].map(([k, n]) => `${k}×${n}`).join(', ');
+      let tally = '';
+      try {
+        const { total, withPicture } = await db.countChatsWithAvatar(user.id);
+        tally = ` ${withPicture}/${total} chats now have one.`;
+      } catch {
+        /* the tally is a nicety */
+      }
       if (checked) {
-        const why = [...reasons].map(([k, n]) => `${k}×${n}`).join(', ');
         console.log(
-          `[${user.id}] Profile pictures: checked ${checked}, found ${found}` +
-            (why ? `. Without one: ${why}` : '.')
+          `[${user.id}] Profile pictures: checked ${checked}, downloaded ${found}` +
+            (why ? `. Without one: ${why}.` : '.') + tally
+        );
+      } else {
+        console.log(
+          `[${user.id}] Profile pictures: nothing due a check right now.` + tally
         );
       }
     } catch (err) {

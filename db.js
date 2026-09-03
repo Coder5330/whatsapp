@@ -129,6 +129,17 @@ ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_checked_at BIGINT;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 
+-- An earlier version recorded a chat as checked once it had a URL, before
+-- there was anywhere to put the picture itself. Those rows count as checked
+-- and so are skipped for twelve hours, but hold no bytes to show — the
+-- pictures could never appear. Mark them unchecked so they are fetched
+-- properly. Rows where WhatsApp genuinely offered no picture have no url
+-- either and are left alone.
+UPDATE wa_chats
+   SET avatar_checked_at = NULL
+ WHERE avatar_bytes IS NULL
+   AND avatar_url IS NOT NULL;
+
 -- An earlier version stored the chat's own number as its name. That is not
 -- a name, and because the column is COALESCEd on write it outranks the real
 -- one forever once written. Clear those rows; the number is derived from
@@ -434,6 +445,18 @@ async function getChatAvatar(inboxId, chatId) {
 
 // The chats worth asking about: most recent first, and only those never
 // checked or checked longer ago than `staleBefore`.
+// How many chats there are to have pictures for, so "nothing to do" can be
+// told apart from "nothing happened".
+async function countChatsWithAvatar(inboxId) {
+  const { rows } = await getPool().query(
+    `SELECT count(*)::int AS total,
+            count(avatar_bytes)::int AS with_picture
+       FROM wa_chats WHERE inbox_id = $1`,
+    [inboxId]
+  );
+  return { total: rows[0].total, withPicture: rows[0].with_picture };
+}
+
 async function chatsNeedingAvatar(inboxId, staleBefore, limit) {
   const { rows } = await getPool().query(
     `SELECT chat_id FROM wa_chats
@@ -635,6 +658,7 @@ module.exports = {
   setChatAvatar,
   getChatAvatar,
   chatsNeedingAvatar,
+  countChatsWithAvatar,
   upsertMessages,
   listChats,
   listMessages,
