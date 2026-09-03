@@ -115,6 +115,41 @@ function describeMessage(waMessage) {
   return { mediaKind: null, body: text };
 }
 
+// What gets stored is the message, not the file — a 100MB video costs a row,
+// not 100MB. But two fields in that row are large and never read back.
+//
+// `streamingSidecar` is per-chunk MAC data for seeking within a video while
+// it streams; it grows with the length of the video and the download path
+// never touches it. `contextInfo.quotedMessage` is a whole nested copy of
+// the message being replied to, thumbnail and all, and the viewer does not
+// render quotes.
+//
+// The thumbnails themselves stay — those are what make a picture appear
+// instantly instead of after a download.
+function slimForStorage(waMessage) {
+  if (!waMessage || !waMessage.message) return waMessage;
+
+  // Go through protobuf's own toJSON first. Spreading the message object
+  // directly would drop that method, and every byte field would then
+  // serialise as {"type":"Buffer","data":[...]} — several times larger than
+  // the base64 it should be, and a shape the download path cannot read the
+  // media key back out of.
+  let plain;
+  try {
+    plain = JSON.parse(JSON.stringify(waMessage));
+  } catch {
+    return waMessage;
+  }
+  if (!plain || !plain.message) return waMessage;
+
+  for (const node of Object.values(plain.message)) {
+    if (!node || typeof node !== 'object') continue;
+    delete node.streamingSidecar;
+    if (node.contextInfo) delete node.contextInfo.quotedMessage;
+  }
+  return plain;
+}
+
 function messageRow(waMessage, contactNames) {
   const key = waMessage.key || {};
   const chatId = realJid(key.remoteJid, key.senderPn);
@@ -143,7 +178,7 @@ function messageRow(waMessage, contactNames) {
     // Kept so the media can be fetched later: downloading needs the
     // protocol message, and re-requesting it from WhatsApp is not possible
     // once the socket has moved on.
-    raw: mediaKind ? waMessage : null
+    raw: mediaKind ? slimForStorage(waMessage) : null
   };
 }
 
@@ -815,5 +850,5 @@ module.exports = {
   thumbnailOf,
   // Exposed for tests: these are pure, and the jid shapes they handle are
   // fiddly enough to be worth pinning down without a live socket.
-  __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid }
+  __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid, slimForStorage }
 };
