@@ -560,6 +560,15 @@ body.viewer { height: 100vh; overflow: hidden; }
 
 .media-audio { width: 100%; min-width: 240px; max-width: 320px; display: block; }
 
+/* The embedded preview is a low-resolution JPEG, so it is blurred on
+   purpose until the real file lands on top of it. */
+.media-img.preview {
+  filter: blur(6px);
+  transform: scale(1.02);
+}
+
+.media-img { transition: filter .18s ease-out; }
+
 .media-file {
   display: inline-block;
   font-size: 13.5px;
@@ -1359,8 +1368,18 @@ function viewerPage(user) {
   }
 
   function mediaUrl(messageId) {
+    return messageBase(messageId) + '/media';
+  }
+
+  // The embedded preview, which costs a database read rather than a
+  // download from WhatsApp.
+  function thumbUrlFor(messageId) {
+    return messageBase(messageId) + '/thumb';
+  }
+
+  function messageBase(messageId) {
     return '/api/' + encodeURIComponent(userId) + '/messages/' +
-      encodeURIComponent(messageId) + '/media';
+      encodeURIComponent(messageId);
   }
 
   var MEDIA_LABEL = {
@@ -1371,10 +1390,34 @@ function viewerPage(user) {
   // Media is fetched per message rather than inlined into the chat payload,
   // so a chat full of photos still opens immediately and the images stream
   // in behind it.
+  // Nothing downloads until it is nearly on screen. A chat of a hundred
+  // messages otherwise asks WhatsApp for every picture in it at once, and
+  // the one being looked at queues behind the rest.
+  var nearViewport =
+    'IntersectionObserver' in window
+      ? new IntersectionObserver(
+          function (entries) {
+            entries.forEach(function (e) {
+              if (!e.isIntersecting) return;
+              nearViewport.unobserve(e.target);
+              if (e.target._load) e.target._load();
+            });
+          },
+          { rootMargin: '600px 0px' }
+        )
+      : null;
+
+  function whenNear(el, load) {
+    if (!nearViewport) return load();
+    el._load = load;
+    nearViewport.observe(el);
+  }
+
   function buildMedia(m) {
     var wrap = document.createElement('div');
     wrap.className = 'media-wrap';
     var url = mediaUrl(m.id);
+    var thumbUrl = thumbUrlFor(m.id);
 
     function failed(note) {
       var f = document.createElement('div');
@@ -1391,12 +1434,34 @@ function viewerPage(user) {
       link.rel = 'noopener';
       var img = document.createElement('img');
       img.className = 'media-img' + (m.mediaKind === 'sticker' ? ' sticker' : '');
-      img.loading = 'lazy';
       img.alt = MEDIA_LABEL[m.mediaKind];
-      img.addEventListener('error', function () { failed(MEDIA_LABEL[m.mediaKind] + ' unavailable'); });
-      img.src = url;
       link.appendChild(img);
       wrap.appendChild(link);
+
+      whenNear(wrap, function () {
+        var haveThumb = false;
+        // The preview comes straight out of the database, so it lands almost
+        // at once; the real file replaces it whenever it arrives.
+        var thumb = new Image();
+        thumb.onload = function () {
+          if (img.dataset.full) return;
+          haveThumb = true;
+          img.src = thumbUrl;
+          img.classList.add('preview');
+        };
+        thumb.src = thumbUrl;
+
+        var full = new Image();
+        full.onload = function () {
+          img.dataset.full = '1';
+          img.src = url;
+          img.classList.remove('preview');
+        };
+        full.onerror = function () {
+          if (!haveThumb) failed(MEDIA_LABEL[m.mediaKind] + ' unavailable');
+        };
+        full.src = url;
+      });
       return wrap;
     }
 
@@ -1405,9 +1470,11 @@ function viewerPage(user) {
       video.className = 'media-img';
       video.controls = true;
       video.preload = 'metadata';
+      // A still frame to look at while the video itself is fetched.
+      video.poster = thumbUrl;
       video.addEventListener('error', function () { failed('Video unavailable'); });
-      video.src = url;
       wrap.appendChild(video);
+      whenNear(wrap, function () { video.src = url; });
       return wrap;
     }
 
@@ -1415,10 +1482,10 @@ function viewerPage(user) {
       var audio = document.createElement('audio');
       audio.className = 'media-audio';
       audio.controls = true;
-      audio.preload = 'metadata';
+      audio.preload = 'none';
       audio.addEventListener('error', function () { failed('Audio unavailable'); });
-      audio.src = url;
       wrap.appendChild(audio);
+      whenNear(wrap, function () { audio.src = url; });
       return wrap;
     }
 

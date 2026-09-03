@@ -638,10 +638,18 @@ app.get('/api/:userId/chats', async (req, res) => {
 // Downloading is slow enough that a re-render must not re-fetch, but media
 // is large, so the cache is bounded by both count and total bytes and drops
 // the oldest entry first.
-const MEDIA_CACHE_MAX_ITEMS = 40;
+// Scrolling a chat full of stickers used to evict its own entries and then
+// download them all again on the way back up. The byte ceiling is what
+// actually bounds memory, so the item count can afford to be generous.
+const MEDIA_CACHE_MAX_ITEMS = 250;
 const MEDIA_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const mediaCache = new Map();
 let mediaCacheBytes = 0;
+
+// Opening a chat asks for every visible picture at once, and the same
+// message can be asked for again before the first download has finished.
+// One download per message, however many requests are waiting on it.
+const mediaInFlight = new Map();
 
 function cacheGet(key) {
   const hit = mediaCache.get(key);
@@ -671,6 +679,14 @@ function cachePut(key, entry) {
 // the viewer had written it.
 const INLINE_MIME = /^(image\/(png|jpeg|gif|webp|bmp)|video\/(mp4|webm|ogg|quicktime)|audio\/(mpeg|mp4|ogg|wav|webm|aac|amr))$/i;
 
+// WhatsApp sends voice notes as `audio/ogg; codecs=opus`. The pattern above
+// is anchored, so the parameter made it fail the match, and the file went
+// out as an octet-stream attachment that no <audio> element would play —
+// the "Audio unavailable" in the viewer. Match on the type alone.
+function baseMime(mimetype) {
+  return String(mimetype || '').split(';')[0].trim().toLowerCase();
+}
+
 app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
   const user = getUserOr404(req, res);
   if (!user) return;
@@ -689,7 +705,19 @@ app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
     if (!stored || !stored.raw) return res.status(404).json({ error: 'Message has no media' });
 
     try {
-      const media = await wa.fetchMedia(stored.raw);
+      // The socket is what lets an expired URL be re-uploaded rather than
+      // failing; if this inbox is offline the download still tries, it just
+      // cannot recover a stale one.
+      const live = sessions.get(user.id);
+      const socket = live && live.socket ? live.socket : null;
+
+      let pending = mediaInFlight.get(cacheKey);
+      if (!pending) {
+        pending = wa.fetchMedia(stored.raw, socket).finally(() => mediaInFlight.delete(cacheKey));
+        mediaInFlight.set(cacheKey, pending);
+      }
+      const media = await pending;
+
       if (!media || !media.buffer || media.buffer.length === 0) {
         return res.status(410).json({ error: 'Media is no longer available' });
       }
@@ -707,14 +735,41 @@ app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
     }
   }
 
-  const inline = INLINE_MIME.test(entry.mimetype);
+  const inline = INLINE_MIME.test(baseMime(entry.mimetype));
   const safeName = (entry.filename || 'attachment').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
 
   res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Cache-Control', 'private, max-age=3600');
+  // A message's media never changes, so the browser should never ask twice.
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
   res.type(inline ? entry.mimetype : 'application/octet-stream');
   res.set('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
   res.send(entry.buffer);
+});
+
+// The preview WhatsApp embeds in the message. It comes out of Postgres with
+// no call to WhatsApp at all, so it answers in milliseconds where the full
+// download takes a second or more — the viewer shows this first and swaps
+// the real thing in behind it.
+app.get('/api/:userId/messages/:messageId/thumb', async (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+
+  let stored;
+  try {
+    stored = await db.getMessageRaw(user.id, req.params.messageId);
+  } catch (err) {
+    console.error(`[${user.id}] thumbnail lookup failed:`, err.message);
+    return res.status(500).json({ error: 'Could not read that message' });
+  }
+  if (!stored || !stored.raw) return res.status(404).json({ error: 'No preview' });
+
+  const thumb = wa.thumbnailOf(stored.raw);
+  if (!thumb) return res.status(404).json({ error: 'No preview' });
+
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
+  res.type(thumb.mimetype);
+  res.send(thumb.buffer);
 });
 
 app.get('/api/:userId/chats/:chatId/messages', async (req, res) => {

@@ -296,6 +296,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   const LOOKUP_GAP_MS = 400;
   const AVATAR_TTL_MS = 12 * 60 * 60 * 1000;
   const AVATAR_BATCH = 60;
+  // One batch per connection left everything past the first 60 chats
+  // waiting for the next restart. Keep going until nothing is stale.
+  const AVATAR_MAX_PASSES = 20;
 
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -346,29 +349,47 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   async function refreshAvatars() {
     if (refreshingAvatars || !state.isReady) return;
     refreshingAvatars = true;
+    let checked = 0;
     let found = 0;
+    const reasons = new Map();
+
     try {
-      const ids = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
-      for (const id of ids) {
-        const socket = state.socket;
-        if (!socket || !state.isReady) break;
-        let url = null;
-        try {
-          url = await socket.profilePictureUrl(id, 'preview');
-        } catch {
-          // No picture, or hidden by that person's privacy settings.
-          url = null;
+      for (let pass = 0; pass < AVATAR_MAX_PASSES; pass++) {
+        const ids = await db.chatsNeedingAvatar(user.id, Date.now() - AVATAR_TTL_MS, AVATAR_BATCH);
+        if (!ids.length) break;
+
+        for (const id of ids) {
+          const socket = state.socket;
+          if (!socket || !state.isReady) break;
+          let url = null;
+          try {
+            url = await socket.profilePictureUrl(id, 'preview');
+          } catch (err) {
+            // No picture, hidden by that person's privacy settings, or a jid
+            // WhatsApp will not answer for. Counted by reason so the log
+            // says which, rather than leaving every avatar blank in silence.
+            const why = (err && (err.output?.statusCode || err.message)) || 'unknown';
+            reasons.set(String(why), (reasons.get(String(why)) || 0) + 1);
+            url = null;
+          }
+          try {
+            await db.setChatAvatar(user.id, id, url);
+          } catch (err) {
+            console.warn(`[${user.id}] Could not store an avatar:`, err.message);
+          }
+          checked += 1;
+          if (url) found += 1;
+          await pause(LOOKUP_GAP_MS);
         }
-        try {
-          await db.setChatAvatar(user.id, id, url);
-        } catch (err) {
-          console.warn(`[${user.id}] Could not store an avatar:`, err.message);
-        }
-        if (url) found += 1;
-        await pause(LOOKUP_GAP_MS);
+        if (!state.isReady) break;
       }
-      if (ids.length) {
-        console.log(`[${user.id}] Checked ${ids.length} profile pictures, found ${found}.`);
+
+      if (checked) {
+        const why = [...reasons].map(([k, n]) => `${k}×${n}`).join(', ');
+        console.log(
+          `[${user.id}] Profile pictures: checked ${checked}, found ${found}` +
+            (why ? `. Without one: ${why}` : '.')
+        );
       }
     } catch (err) {
       console.warn(`[${user.id}] Profile picture refresh failed:`, err.message);
@@ -493,7 +514,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // never block the inbox coming up. Tracked so a socket that drops in
       // the meantime takes the pending lookup down with it.
       clearTimeout(avatarTimer);
-      avatarTimer = setTimeout(() => refreshAvatars(), 15000);
+      avatarTimer = setTimeout(() => refreshAvatars(), 5000);
       return;
     }
 
@@ -649,6 +670,15 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // it does not.
   async function loadStoredNames() {
     try {
+      // Name every chat that has ever received a message, before reading
+      // the list back — otherwise those names only appear as new messages
+      // arrive, which is why they used to trickle in.
+      const filled = await db.backfillContactNames(user.id);
+      if (filled) console.log(`[${user.id}] Named ${filled} chats from messages already stored.`);
+    } catch (err) {
+      console.warn(`[${user.id}] Could not backfill names:`, err.message);
+    }
+    try {
       const rows = await db.listContacts(user.id);
       for (const r of rows) state.contactNames.set(r.jid, r.name);
       if (rows.length) console.log(`[${user.id}] Recalled ${rows.length} contact names.`);
@@ -699,10 +729,64 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   return state;
 }
 
+// The small preview WhatsApp embeds in the message itself. It is already in
+// Postgres, so this costs a row read rather than a round trip to WhatsApp —
+// the difference between a picture appearing at once and appearing in a
+// second or two. Stored as base64 because that is what protobuf's toJSON
+// does with the bytes on the way into the JSONB column.
+function thumbnailOf(rawMessage) {
+  const node = mediaNodeOf(rawMessage);
+  if (!node) return null;
+
+  // Pictures and videos carry a JPEG preview; stickers carry a PNG one under
+  // a different field name entirely. Audio carries nothing — there is
+  // nothing to preview.
+  const raw = node.jpegThumbnail || node.pngThumbnail;
+  if (!raw) return null;
+  const mimetype = node.pngThumbnail && !node.jpegThumbnail ? 'image/png' : 'image/jpeg';
+
+  try {
+    let buffer;
+    if (typeof raw === 'string') buffer = Buffer.from(raw, 'base64');
+    else if (Buffer.isBuffer(raw)) buffer = raw;
+    else if (raw.data) buffer = Buffer.from(raw.data); // {type:'Buffer',data:[...]}
+    else buffer = Buffer.from(Object.values(raw));
+    return buffer.length ? { buffer, mimetype } : null;
+  } catch {
+    return null;
+  }
+}
+
+function mediaNodeOf(rawMessage) {
+  const inner = (rawMessage && rawMessage.message) || {};
+  const unwrapped =
+    inner.ephemeralMessage?.message ||
+    inner.viewOnceMessage?.message ||
+    inner.viewOnceMessageV2?.message ||
+    inner.documentWithCaptionMessage?.message ||
+    inner;
+  return (
+    unwrapped.imageMessage ||
+    unwrapped.stickerMessage ||
+    unwrapped.videoMessage ||
+    unwrapped.audioMessage ||
+    unwrapped.documentMessage ||
+    null
+  );
+}
+
 // Media is not stored, only the message that describes it, so downloading
 // asks WhatsApp for the bytes on demand.
-async function fetchMedia(rawMessage) {
-  const buffer = await downloadMediaMessage(rawMessage, 'buffer', {});
+//
+// `socket` is optional but worth passing: WhatsApp expires the URL in a
+// message after a while, and the only way back is to ask it to re-upload
+// the file. Without a socket that path cannot run and an older sticker or
+// voice note simply fails, which is why some rendered and some did not.
+async function fetchMedia(rawMessage, socket) {
+  const ctx = socket
+    ? { reuploadRequest: socket.updateMediaMessage, logger: socket.logger || console }
+    : undefined;
+  const buffer = await downloadMediaMessage(rawMessage, 'buffer', {}, ctx);
   const inner = rawMessage.message || {};
   const unwrapped =
     inner.ephemeralMessage?.message ||
@@ -728,6 +812,7 @@ async function fetchMedia(rawMessage) {
 module.exports = {
   createInboxConnection,
   fetchMedia,
+  thumbnailOf,
   // Exposed for tests: these are pure, and the jid shapes they handle are
   // fiddly enough to be worth pinning down without a live socket.
   __test: { messageRow, chatRowFromMessage, describeMessage, displayNumber, realJid }

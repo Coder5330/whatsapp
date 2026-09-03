@@ -364,6 +364,31 @@ async function upsertContacts(inboxId, contacts) {
   return rows.length;
 }
 
+// Every message already carries the sender's own display name, and those
+// are already stored. So a chat that has ever received a message can be
+// named right now instead of waiting for the next one to arrive — which is
+// what made names trickle in over several minutes.
+//
+// One-to-one chats only: whoever last spoke in a group does not name it.
+async function backfillContactNames(inboxId) {
+  const { rowCount } = await getPool().query(
+    `INSERT INTO wa_contacts (inbox_id, jid, name)
+     SELECT DISTINCT ON (m.chat_id) $1, m.chat_id, m.sender_name
+       FROM wa_messages m
+       JOIN wa_chats c
+         ON c.inbox_id = m.inbox_id AND c.chat_id = m.chat_id AND c.is_group = false
+      WHERE m.inbox_id = $1
+        AND m.from_me = false
+        AND m.sender_name IS NOT NULL
+        AND m.sender_name <> ''
+        AND m.sender_name <> split_part(m.chat_id, '@', 1)
+      ORDER BY m.chat_id, m.ts DESC
+     ON CONFLICT (inbox_id, jid) DO NOTHING`,
+    [inboxId]
+  );
+  return rowCount || 0;
+}
+
 // Read back at startup so a restart does not begin with every name blank.
 async function listContacts(inboxId) {
   const { rows } = await getPool().query(
@@ -579,6 +604,7 @@ module.exports = {
   resetInbox,
   upsertChats,
   upsertContacts,
+  backfillContactNames,
   listContacts,
   setChatAvatar,
   chatsNeedingAvatar,
