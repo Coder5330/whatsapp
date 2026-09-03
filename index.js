@@ -80,13 +80,16 @@ function dormantSession() {
 
 // `startAfterMs` staggers connections. Nothing heavy is being launched any
 // more, but it still spreads out the history sync that follows.
-function createSessionForUser(user, startAfterMs = 0) {
+// `requested` means a person pressed the button asking to link this inbox.
+// Without it, an inbox with no stored session waits instead of connecting,
+// so linking codes are only ever generated for someone who is watching.
+function createSessionForUser(user, startAfterMs = 0, { requested = false } = {}) {
   const state = wa.createInboxConnection(user, SESSION_ROOT, {
     onClaimCode: (u, st) => issueClaimCodeIfNeeded(u, st)
   });
 
   const launch = () =>
-    state.start().catch((err) =>
+    state.start({ requested }).catch((err) =>
       console.error(`[${user.id}] Startup failed unexpectedly:`, err && err.message)
     );
 
@@ -512,7 +515,7 @@ app.post('/:userId/unlink', async (req, res) => {
     sessions.set(user.id, dormantSession());
     console.log(`[${user.id}] Session cleared, but the inbox stays paused (MAX_ACTIVE_INBOXES).`);
   } else {
-    sessions.set(user.id, createSessionForUser(user));
+    sessions.set(user.id, createSessionForUser(user, 0, { requested: true }));
   }
 
   res.redirect(`/${encodeURIComponent(user.id)}/qr`);
@@ -554,7 +557,7 @@ app.post('/:userId/qr/refresh', async (req, res) => {
       console.warn(`[${user.id}] Could not stop the old connection cleanly:`, err.message);
     }
   }
-  sessions.set(user.id, createSessionForUser(user));
+  sessions.set(user.id, createSessionForUser(user, 0, { requested: true }));
   res.redirect(`/${encodeURIComponent(user.id)}/qr`);
 });
 

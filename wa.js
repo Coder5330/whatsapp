@@ -242,6 +242,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     // Stopped offering linking codes because nobody was scanning them —
     // waiting to be asked, not broken.
     pausedForScan: false,
+    // Set once a person has asked for a code, so reconnects after that do
+    // not fall straight back into waiting.
+    linkRequested: false,
     socket: null,
     contactNames: new Map(),
     dormant: false
@@ -829,7 +832,35 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     }
   }
 
-  async function start() {
+  // A linked inbox has credentials on disk and reconnects without ever
+  // showing a code. One with none can only come up by someone scanning, and
+  // scanning needs a person present — so starting it at boot just spends
+  // WhatsApp's linking allowance at an empty page, ten codes every deploy.
+  function hasStoredSession() {
+    try {
+      return fs.existsSync(path.join(authDir, 'creds.json'));
+    } catch {
+      return false;
+    }
+  }
+
+  async function start(options = {}) {
+    if (options.requested) state.linkRequested = true;
+
+    if (!state.linkRequested && !hasStoredSession()) {
+      state.latestQr = null;
+      state.pausedForScan = true;
+      state.startupError =
+        'This inbox is not linked to WhatsApp yet. Codes are only generated while ' +
+        'someone is waiting to scan one, because each code uses up part of ' +
+        "WhatsApp's linking allowance. Press the button when you are ready.";
+      state.statusText = 'Not linked. Ask for a code when someone can scan it.';
+      console.log(
+        `[${user.id}] No stored session — not generating codes until someone asks for one.`
+      );
+      return;
+    }
+
     try {
       if (!state.contactNames.size) await loadStoredNames();
       await connect();
