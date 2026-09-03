@@ -199,6 +199,16 @@ async function init() {
     'avatar-recheck-after-download-fix',
     'UPDATE wa_chats SET avatar_checked_at = NULL WHERE avatar_bytes IS NULL'
   );
+
+  // That first re-check was spent by a build that still counted a 500 or a
+  // timeout as "this chat has no picture", so it queued eighteen chats,
+  // failed to ask about all of them, and recorded them as settled anyway.
+  // The key was consumed, so they would now wait another twelve hours. Ask
+  // once more, on a build that knows the difference.
+  await runOnce(
+    'avatar-recheck-after-transient-fix',
+    'UPDATE wa_chats SET avatar_checked_at = NULL WHERE avatar_bytes IS NULL'
+  );
 }
 
 // Returns { userId, passwordHash, claimCodeHash, claimedAt } or null.
