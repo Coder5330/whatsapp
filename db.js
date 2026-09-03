@@ -129,6 +129,14 @@ ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_checked_at BIGINT;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 
+-- Migrations that must happen exactly once, rather than on every boot.
+-- Without this, "re-check everything" would mean re-checking everything at
+-- every restart, which is how an account gets rate-limited by WhatsApp.
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key        TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- An earlier version recorded a chat as checked once it had a URL, before
 -- there was anywhere to put the picture itself. Those rows count as checked
 -- and so are skipped for twelve hours, but hold no bytes to show — the
@@ -150,8 +158,47 @@ UPDATE wa_chats
    AND name = split_part(chat_id, '@', 1);
 `;
 
+// Applies `sql` only if this key has never been recorded. The key insert
+// and the work share a transaction, so a crash midway leaves the key unset
+// and the migration is retried next boot rather than silently skipped.
+async function runOnce(key, sql) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'INSERT INTO schema_meta (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key',
+      [key]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+    const result = await client.query(sql);
+    await client.query('COMMIT');
+    console.log(`Migration ${key}: ${result.rowCount ?? 0} rows.`);
+    return true;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.warn(`Migration ${key} failed, will retry next boot:`, err.message);
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
 async function init() {
   await getPool().query(SCHEMA);
+
+  // Every chat asked about before profile pictures actually worked was
+  // recorded as checked and left blank, and blank is indistinguishable from
+  // "this person has no picture" — so each would sit untouched for twelve
+  // hours. Ask about all of them once more, and let the answers be recorded
+  // with reasons this time. Once only: after this, a blank result really
+  // does mean there is no picture.
+  await runOnce(
+    'avatar-recheck-after-download-fix',
+    'UPDATE wa_chats SET avatar_checked_at = NULL WHERE avatar_bytes IS NULL'
+  );
 }
 
 // Returns { userId, passwordHash, claimCodeHash, claimedAt } or null.
