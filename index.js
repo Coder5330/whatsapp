@@ -746,6 +746,30 @@ app.get('/api/:userId/messages/:messageId/media', async (req, res) => {
   res.send(entry.buffer);
 });
 
+// A chat's profile picture, served from our own origin out of Postgres.
+// Nothing here talks to WhatsApp, so there is no signed URL to expire
+// between the fetch and someone looking at the page.
+app.get('/api/:userId/chats/:chatId/avatar', async (req, res) => {
+  const user = getUserOr404(req, res);
+  if (!user) return;
+
+  let picture;
+  try {
+    picture = await db.getChatAvatar(user.id, req.params.chatId);
+  } catch (err) {
+    console.error(`[${user.id}] avatar lookup failed:`, err.message);
+    return res.status(500).json({ error: 'Could not read that avatar' });
+  }
+  if (!picture) return res.status(404).json({ error: 'No picture' });
+
+  res.set('X-Content-Type-Options', 'nosniff');
+  // People change their picture, so this is refreshed rather than frozen;
+  // the ETag makes the re-check free when it has not changed.
+  res.set('Cache-Control', 'private, max-age=3600');
+  res.type(picture.mimetype);
+  res.send(picture.buffer);
+});
+
 // The preview WhatsApp embeds in the message. It comes out of Postgres with
 // no call to WhatsApp at all, so it answers in milliseconds where the full
 // download takes a second or more — the viewer shows this first and swaps

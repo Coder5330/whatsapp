@@ -120,6 +120,15 @@ ALTER TABLE wa_chats ALTER COLUMN unread_count DROP NOT NULL;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_url TEXT;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_checked_at BIGINT;
 
+-- The picture itself, not a link to it. WhatsApp serves profile pictures
+-- from signed URLs that expire; handing one to a browser meant it worked
+-- until the signature died and then silently fell back to initials, which
+-- is indistinguishable from having no picture at all. A preview is a few
+-- KB, so keeping the bytes is cheap and it cannot go stale on someone
+-- else's schedule.
+ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA;
+ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
+
 -- An earlier version stored the chat's own number as its name. That is not
 -- a name, and because the column is COALESCEd on write it outranks the real
 -- one forever once written. Clear those rows; the number is derived from
@@ -400,12 +409,27 @@ async function listContacts(inboxId) {
 
 // A null url records that WhatsApp was asked and had nothing to give, which
 // stops the next sync from asking again.
-async function setChatAvatar(inboxId, chatId, url) {
+// A default parameter only covers `undefined`, so a caller passing null —
+// the natural way to say "there is no picture" — would throw on destructuring.
+async function setChatAvatar(inboxId, chatId, picture) {
+  const { url = null, bytes = null, mimetype = null } = picture || {};
   await getPool().query(
-    `UPDATE wa_chats SET avatar_url = $3, avatar_checked_at = $4
+    `UPDATE wa_chats
+        SET avatar_url = $3, avatar_bytes = $4, avatar_mime = $5, avatar_checked_at = $6
       WHERE inbox_id = $1 AND chat_id = $2`,
-    [inboxId, chatId, url || null, Date.now()]
+    [inboxId, chatId, url, bytes, mimetype, Date.now()]
   );
+}
+
+// The bytes for one chat, read only when the browser asks for that picture.
+async function getChatAvatar(inboxId, chatId) {
+  const { rows } = await getPool().query(
+    `SELECT avatar_bytes, avatar_mime FROM wa_chats
+      WHERE inbox_id = $1 AND chat_id = $2 AND avatar_bytes IS NOT NULL`,
+    [inboxId, chatId]
+  );
+  if (!rows.length) return null;
+  return { buffer: rows[0].avatar_bytes, mimetype: rows[0].avatar_mime || 'image/jpeg' };
 }
 
 // The chats worth asking about: most recent first, and only those never
@@ -501,7 +525,7 @@ async function upsertMessages(inboxId, messages) {
 async function listChats(inboxId, limit = 200) {
   const { rows } = await getPool().query(
     `SELECT c.chat_id, c.is_group, c.unread_count, c.last_ts, c.last_text,
-            c.last_media, c.avatar_url,
+            c.last_media, (c.avatar_bytes IS NOT NULL) AS has_avatar,
             -- A group is named by its subject, which only the chat row has.
             -- A person is named by the address book, which beats whatever
             -- name they set on their own phone.
@@ -520,7 +544,9 @@ async function listChats(inboxId, limit = 200) {
     // The number is the fallback, computed here rather than stored — a name
     // written into the row would outrank the real one when it arrives.
     name: r.name || r.chat_id.split('@')[0],
-    avatarUrl: r.avatar_url || null,
+    // Whether there is a picture to ask for — never the bytes, which would
+    // make the chat list enormous.
+    hasAvatar: !!r.has_avatar,
     isGroup: r.is_group,
     unreadCount: r.unread_count || 0,
     lastMessage: r.last_ts
@@ -607,6 +633,7 @@ module.exports = {
   backfillContactNames,
   listContacts,
   setChatAvatar,
+  getChatAvatar,
   chatsNeedingAvatar,
   upsertMessages,
   listChats,

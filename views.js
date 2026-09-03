@@ -1169,13 +1169,14 @@ function viewerPage(user) {
   // that 404s (an expired signed URL) removes itself and the initials show.
   function paintAvatar(el, chat) {
     el.textContent = initialsOf(chat.name);
-    if (!chat.avatarUrl) return;
+    if (!chat.hasAvatar) return;
     var img = document.createElement('img');
     img.alt = '';
     img.loading = 'lazy';
     img.onerror = function () { img.remove(); };
     img.onload = function () { el.textContent = ''; el.appendChild(img); };
-    img.src = chat.avatarUrl;
+    img.src = '/api/' + encodeURIComponent(userId) + '/chats/' +
+      encodeURIComponent(chat.id) + '/avatar';
   }
 
   function shortTime(ts) {

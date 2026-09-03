@@ -378,6 +378,26 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   let refreshingAvatars = false;
   let avatarTimer = null;
 
+  // A profile picture preview is a few KB. Anything wildly bigger is not
+  // what we asked for and is not worth putting in a row.
+  const AVATAR_MAX_BYTES = 512 * 1024;
+  const AVATAR_TIMEOUT_MS = 10000;
+
+  async function downloadAvatar(url) {
+    const stop = AbortSignal.timeout
+      ? AbortSignal.timeout(AVATAR_TIMEOUT_MS)
+      : undefined;
+    const res = await fetch(url, { signal: stop });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (!buffer.length) throw new Error('empty');
+    if (buffer.length > AVATAR_MAX_BYTES) throw new Error(`too large (${buffer.length}B)`);
+
+    const mimetype = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+    return { buffer, mimetype };
+  }
+
   // Profile pictures are signed URLs that expire, so this re-asks on a long
   // cycle. A chat with no picture is recorded as checked too, so the ones
   // without are not asked about again every sync.
@@ -397,8 +417,11 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           const socket = state.socket;
           if (!socket || !state.isReady) break;
           let url = null;
+          let picture = null;
           try {
             url = await socket.profilePictureUrl(id, 'preview');
+            // Fetch it now, while the signature on the URL is still valid.
+            if (url) picture = await downloadAvatar(url);
           } catch (err) {
             // No picture, hidden by that person's privacy settings, or a jid
             // WhatsApp will not answer for. Counted by reason so the log
@@ -408,12 +431,17 @@ function createInboxConnection(user, sessionRoot, options = {}) {
             url = null;
           }
           try {
-            await db.setChatAvatar(user.id, id, url);
+            await db.setChatAvatar(user.id, id, {
+              url,
+              bytes: picture ? picture.buffer : null,
+              mimetype: picture ? picture.mimetype : null
+            });
           } catch (err) {
             console.warn(`[${user.id}] Could not store an avatar:`, err.message);
           }
           checked += 1;
-          if (url) found += 1;
+          if (picture) found += 1;
+          else if (url) reasons.set('download-failed', (reasons.get('download-failed') || 0) + 1);
           await pause(LOOKUP_GAP_MS);
         }
         if (!state.isReady) break;
