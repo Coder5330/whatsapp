@@ -439,6 +439,14 @@ function createInboxConnection(user, sessionRoot, options = {}) {
 
   let refreshingAvatars = false;
   let avatarTimer = null;
+  let avatarCycle = null;
+
+  // The twelve-hour staleness check only ever ran five seconds after a
+  // connection opened, so on a link that stays up it never ran again: a
+  // chat that had no picture when first asked would never be asked twice,
+  // and someone changing their photo would never be noticed. Sweep on a
+  // cycle while connected instead.
+  const AVATAR_SWEEP_MS = 6 * 60 * 60 * 1000;
 
   // A profile picture preview is a few KB. Anything wildly bigger is not
   // what we asked for and is not worth putting in a row.
@@ -675,6 +683,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // the meantime takes the pending lookup down with it.
       clearTimeout(avatarTimer);
       avatarTimer = setTimeout(() => refreshAvatars(), 5000);
+      clearInterval(avatarCycle);
+      avatarCycle = setInterval(() => refreshAvatars(), AVATAR_SWEEP_MS);
+      if (avatarCycle.unref) avatarCycle.unref();
       return;
     }
 
@@ -788,6 +799,8 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   async function teardown() {
     clearTimeout(avatarTimer);
     avatarTimer = null;
+    clearInterval(avatarCycle);
+    avatarCycle = null;
     groupQueue.clear();
     const socket = state.socket;
     state.socket = null;
