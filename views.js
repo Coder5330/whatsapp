@@ -267,16 +267,24 @@ code {
   font-size: 15px;
   text-transform: uppercase;
   overflow: hidden;
+  position: relative;
 }
 
-/* The photo covers the initials underneath, so a URL that has expired or a
-   contact who hides their picture falls back on its own with no flicker. */
+/* The photo sits over the initials rather than replacing them, so a picture
+   that fails to load simply never appears and the initials stand. It fades
+   in on load, which also means no flash of a half-drawn image. */
 .avatar img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
+  opacity: 0;
+  transition: opacity .15s ease-out;
 }
+
+.avatar img.ready { opacity: 1; }
 
 .dot {
   width: 8px;
@@ -1191,11 +1199,18 @@ function viewerPage(user) {
   function paintAvatar(el, chat) {
     el.textContent = initialsOf(chat.name);
     if (!chat.hasAvatar) return;
+
+    // The picture goes into the DOM straight away, on top of the initials
+    // but transparent until it has loaded. The previous version held the
+    // image out of the document until its onload fired while also marking
+    // it loading="lazy" — and a lazy image that is not in the document is
+    // never near the viewport, so it never loaded, so onload never fired
+    // and it was never inserted. No request was ever made.
     var img = document.createElement('img');
     img.alt = '';
-    img.loading = 'lazy';
     img.onerror = function () { img.remove(); };
-    img.onload = function () { el.textContent = ''; el.appendChild(img); };
+    img.onload = function () { img.classList.add('ready'); };
+    el.appendChild(img);
     img.src = '/api/' + encodeURIComponent(userId) + '/chats/' +
       encodeURIComponent(chat.id) + '/avatar';
   }
