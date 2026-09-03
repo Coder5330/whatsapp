@@ -468,9 +468,15 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // blip should not be permanent, and a permanent failure should not be
   // retried forever.
   const AVATAR_MAX_FAILURES = 5;
-  // Long enough to be clear of the twenty seconds Baileys spends buffering
-  // history and running its own init queries.
-  const AVATAR_FIRST_DELAY_MS = 45000;
+  // Long enough to be out of the way of the connection settling, short
+  // enough to run before anything can idle this process out.
+  //
+  // This was forty-five seconds on the theory that the 500s came from
+  // asking during Baileys' sync window. That theory was wrong — they were
+  // groups being asked the wrong way — and the long wait introduced a
+  // worse problem: on a host that suspends an idle container, a timer that
+  // far out never fires at all, so the check silently stopped happening.
+  const AVATAR_FIRST_DELAY_MS = 8000;
 
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -882,10 +888,6 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // Pictures are a nicety, so they wait until the socket has settled and
       // never block the inbox coming up. Tracked so a socket that drops in
       // the meantime takes the pending lookup down with it.
-      // Baileys spends its first twenty seconds buffering the history sync
-      // and its own init queries, and asking for pictures in the middle of
-      // that is what produced fourteen 500s and four timeouts. Wait until
-      // that window has closed.
       clearTimeout(avatarTimer);
       avatarTimer = setTimeout(() => refreshAvatars(), AVATAR_FIRST_DELAY_MS);
       console.log(
