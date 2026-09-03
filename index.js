@@ -518,6 +518,46 @@ app.post('/:userId/unlink', async (req, res) => {
   res.redirect(`/${encodeURIComponent(user.id)}/qr`);
 });
 
+// ---- A fresh QR code, on request ----
+// WhatsApp rotates the linking code every twenty seconds and limits how
+// often an account may link a device, so an inbox that nobody is scanning
+// stops offering codes rather than spending that allowance on an empty
+// room. This is how a person says they are ready now.
+//
+// Unlike unlinking, nothing is thrown away: the stored session and the
+// chat history stay, the connection is simply started again so WhatsApp
+// issues a new code.
+app.post('/:userId/qr/refresh', async (req, res) => {
+  const ctx = await resolveInbox(req, res);
+  if (!ctx) return;
+  const { user, cred } = ctx;
+
+  if (isClaimed(cred) && !auth.isLoggedInAs(req, user.id, cred.passwordHash)) {
+    return res.redirect(
+      `/${encodeURIComponent(user.id)}/login?next=` + encodeURIComponent(`/${user.id}/qr`)
+    );
+  }
+
+  const previous = sessions.get(user.id);
+
+  // A paused inbox is paused by the operator, not by the code counter, and
+  // asking for a QR code must not be a way around that.
+  if (previous && previous.dormant) {
+    return res.redirect(`/${encodeURIComponent(user.id)}/qr`);
+  }
+
+  console.log(`[${user.id}] New QR code requested.`);
+  if (previous && previous.stop) {
+    try {
+      await previous.stop();
+    } catch (err) {
+      console.warn(`[${user.id}] Could not stop the old connection cleanly:`, err.message);
+    }
+  }
+  sessions.set(user.id, createSessionForUser(user));
+  res.redirect(`/${encodeURIComponent(user.id)}/qr`);
+});
+
 // ---- Change password ----
 
 app.get('/:userId/password', async (req, res) => {

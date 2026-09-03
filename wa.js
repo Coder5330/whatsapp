@@ -41,6 +41,13 @@ const RETRY_MAX_DELAY_MS = 60000;
 // going wrong.
 const RETRY_NOISY_AFTER = 3;
 
+// WhatsApp rotates the linking code every twenty seconds or so, and limits
+// how often an account may link a device. An inbox nobody is scanning will
+// happily spend that allowance all day — thirty codes in a few minutes, for
+// a page no one has open. Stop offering codes after this many and wait to
+// be asked again.
+const MAX_QR_PER_RUN = 10;
+
 function backoffFor(attempts) {
   const steps = Math.min(Math.max(0, attempts - 1), 10);
   return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** steps);
@@ -232,6 +239,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     // sends someone looking in the wrong place entirely.
     retryKind: null,
     diskFull: false,
+    // Stopped offering linking codes because nobody was scanning them —
+    // waiting to be asked, not broken.
+    pausedForScan: false,
     socket: null,
     contactNames: new Map(),
     dormant: false
@@ -242,6 +252,52 @@ function createInboxConnection(user, sessionRoot, options = {}) {
 
   // Names learned this run that are not yet on disk.
   const pendingContacts = new Map();
+
+  // WhatsApp will re-deliver a message it thinks was not acknowledged, and
+  // Baileys re-emits it every time — the same message can arrive many times
+  // a second, and each arrival was a write to Postgres. Remember what has
+  // just been stored and let the repeats fall on the floor.
+  const RECENT_TTL_MS = 5 * 60 * 1000;
+  const RECENT_MAX = 2000;
+  const recentlyStored = new Map();
+  let suppressed = 0;
+  let suppressedLoggedAt = 0;
+
+  // Identity plus the parts that could legitimately change, so a message
+  // that genuinely gains content is still written.
+  function fingerprint(row) {
+    return `${row.id}|${row.ts}|${row.mediaKind || ''}|${(row.body || '').length}`;
+  }
+
+  function isRepeat(row) {
+    const key = fingerprint(row);
+    const seen = recentlyStored.get(key);
+    const now = Date.now();
+    if (seen && now - seen < RECENT_TTL_MS) return true;
+    recentlyStored.set(key, now);
+    if (recentlyStored.size > RECENT_MAX) {
+      // Oldest first: Map preserves insertion order.
+      for (const k of recentlyStored.keys()) {
+        recentlyStored.delete(k);
+        if (recentlyStored.size <= RECENT_MAX * 0.8) break;
+      }
+    }
+    return false;
+  }
+
+  function noteSuppressed(n) {
+    if (!n) return;
+    suppressed += n;
+    const now = Date.now();
+    // One line a minute at most; the point is to show it is happening, not
+    // to replace one flood of logging with another.
+    if (now - suppressedLoggedAt < 60000) return;
+    suppressedLoggedAt = now;
+    console.log(
+      `[${user.id}] Ignored ${suppressed} re-delivered message(s) that were already stored.`
+    );
+    suppressed = 0;
+  }
 
   function learnName(jid, name) {
     const key = jidOf(jid);
@@ -291,9 +347,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       })
       .filter(Boolean);
 
-    const messageRows = messages
+    const allMessageRows = messages
       .map((m) => messageRow(m, state.contactNames))
       .filter(Boolean);
+
+    const messageRows = allMessageRows.filter((row) => !isRepeat(row));
+    noteSuppressed(allMessageRows.length - messageRows.length);
 
     try {
       if (chatRows.length) await db.upsertChats(user.id, chatRows);
@@ -545,6 +604,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       // earlier failures earned is stale. Start counting again from zero.
       state.attempts = 0;
       state.qrCount += 1;
+      state.pausedForScan = false;
       try {
         state.latestQr = await qrcode.toDataURL(qr);
       } catch (err) {
@@ -555,6 +615,24 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       console.log(
         `[${user.id}] QR code updated (#${state.qrCount}). Visit /${user.id}/qr to scan it.`
       );
+
+      if (state.qrCount >= MAX_QR_PER_RUN) {
+        // Generating codes nobody scans is not free: it spends this
+        // account's device-linking allowance and can get further attempts
+        // refused. Stop until a person asks for a new one.
+        state.latestQr = null;
+        state.pausedForScan = true;
+        state.startupError =
+          `No one scanned the code after ${state.qrCount} tries, so this inbox stopped ` +
+          'generating them — each one uses up part of WhatsApp\'s linking allowance. ' +
+          'Press the button below when you are ready to scan.';
+        state.statusText = 'Paused. Nobody scanned the QR code.';
+        console.warn(
+          `[${user.id}] Stopping after ${state.qrCount} unscanned QR codes, to stop ` +
+            'spending this account\'s linking allowance. Use the inbox page to start over.'
+        );
+        await teardown();
+      }
       return;
     }
 
@@ -569,6 +647,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.retryNotice = null;
       state.retryKind = null;
       state.diskFull = false;
+      state.pausedForScan = false;
       state.isReady = true;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Connected. Syncing history in the background.`);

@@ -168,6 +168,9 @@ button:active { transform: translateY(1px); }
 
 .unlink .hint { margin-top: 10px; }
 
+.newcode { margin-top: 18px; }
+.newcode button { padding: 10px 16px; }
+
 .alert {
   background: var(--danger-soft);
   color: var(--danger);
@@ -896,6 +899,17 @@ function homePage(entries, capacity = { max: 0, used: 0, needsInvite: false, err
 // claimCode is passed only when this server watched the QR get scanned in
 // this process — never for a session restored from disk, where the QR page
 // is reachable by anyone who has not claimed it yet.
+// Asks WhatsApp for a new linking code. Codes are only generated while
+// someone is actually waiting to scan one, so this is how they say so.
+// Keeps the session and the stored chats — it is not the unlink button.
+function newCodeForm(user, label) {
+  const id = escapeHtml(user.id);
+  return `
+    <form method="post" action="/${id}/qr/refresh" class="newcode">
+      <button type="submit">${escapeHtml(label)}</button>
+    </form>`;
+}
+
 // The manual way out. Shown on every state of this page, because the whole
 // point is that it works when the app's own idea of the link is wrong.
 function unlinkForm(user) {
@@ -976,7 +990,9 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
     const struggling = !dormant && !failed && !linking && !relinking && !!state.retryNotice;
     const heading = dormant
       ? 'This inbox is not running'
-      : failed
+      : state.pausedForScan
+        ? 'Waiting until someone is ready'
+        : failed
         ? 'WhatsApp did not start'
         : linking
           ? 'Scan accepted — finishing sign-in'
@@ -988,7 +1004,9 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
                 : 'Reconnecting to WhatsApp'
               : 'Generating QR code…';
     return page({
-      title: failed
+      title: state.pausedForScan
+        ? `Ready when you are — ${user.name}`
+        : failed
         ? `Startup trouble — ${user.name}`
         : relinking
           ? `Re-link ${user.name} — WhatsApp Viewer`
@@ -1011,8 +1029,9 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
         : failed
         ? `<div class="alert">${escapeHtml(state.startupError)}</div>
            <p class="hint">
-             This inbox has stopped trying, which only happens when linking
-             itself keeps failing. Restart the service to start over.
+             Nothing is lost by waiting — the saved session and the stored
+             chats are still here. Ask for a new code when someone is
+             actually holding the phone, and one is generated then.
            </p>`
         : linking
           ? `<p class="hint">
@@ -1059,6 +1078,7 @@ function qrPage({ user, state, claimCode = null, needsSetup = false }) {
                 : ''
             }<span class="pill">This page refreshes automatically</span>`
     }
+    ${dormant ? '' : newCodeForm(user, 'Show a new QR code')}
     ${dormant ? '' : unlinkForm(user)}
   </div>
 </div>
@@ -1083,9 +1103,10 @@ ${dormant ? '' : `<script>setTimeout(function () { location.reload(); }, ${faile
       ${
         needsSetup
           ? 'After scanning you will be shown a one-time setup code for choosing this inbox&rsquo;s password.'
-          : 'Codes expire after a while — this page refreshes itself.'
+          : 'Codes expire after a while. If this one stops working, ask for a new one.'
       }
     </p>
+    ${newCodeForm(user, 'Show a new QR code')}
     ${unlinkForm(user)}
   </div>
 </div>
