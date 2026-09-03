@@ -21,8 +21,7 @@ const {
   fetchLatestBaileysVersion,
   downloadMediaMessage,
   jidNormalizedUser,
-  isLidUser,
-  getBinaryNodeChild
+  isLidUser
 } = require('baileys');
 
 const db = require('./db');
@@ -589,7 +588,13 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // and 404 (no picture set) are answers — record them and stop asking. A
   // 500, a 408, or a dropped socket is not an answer, it is a failure to
   // ask, and recording it as "checked" means never asking again.
-  const DEFINITIVE = new Set([401, 403, 404]);
+  // 401 and 403 are privacy settings; 404 is no picture set. 500 belongs
+  // here too, despite reading like a server fault: it is what WhatsApp
+  // returns for a group with no picture, and treating it as a failure to
+  // ask meant retrying it forever. Settling is not permanent — the row is
+  // simply marked checked, and the twelve-hour sweep asks again — so the
+  // cost of being wrong about it is one stale avatar for half a day.
+  const DEFINITIVE = new Set([401, 403, 404, 500]);
 
   function isDefinitive(err) {
     const code = err && (err.output?.statusCode ?? err.status);
@@ -606,27 +611,12 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     return true;
   }
 
-  // Baileys sends the picture query to s.whatsapp.net with the jid as a
-  // `target` attribute. WhatsApp accepts that for a person and answers
-  // internal-server-error for a group, which is where fourteen 500s came
-  // from — every one of them a @g.us. A group has to be asked directly.
-  async function groupPictureUrl(socket, jid) {
-    const result = await socket.query(
-      {
-        tag: 'iq',
-        attrs: { to: jid, type: 'get', xmlns: 'w:profile:picture' },
-        content: [{ tag: 'picture', attrs: { type: 'preview', query: 'url' } }]
-      },
-      AVATAR_QUERY_TIMEOUT_MS
-    );
-    const picture = getBinaryNodeChild(result, 'picture');
-    return picture && picture.attrs ? picture.attrs.url : null;
-  }
-
+  // Addressing the query straight at a group was tried, on the theory that
+  // the 500s came from Baileys routing it via s.whatsapp.net. It was worse:
+  // WhatsApp did not answer at all, so a fast error became a ten-second
+  // timeout. Baileys' own helper is the right call for everyone.
   function pictureUrlFor(socket, jid) {
-    return isGroupJid(jid)
-      ? groupPictureUrl(socket, jid)
-      : socket.profilePictureUrl(jid, 'preview', AVATAR_QUERY_TIMEOUT_MS);
+    return socket.profilePictureUrl(jid, 'preview', AVATAR_QUERY_TIMEOUT_MS);
   }
 
   async function refreshAvatars() {
