@@ -445,6 +445,29 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     });
   }
 
+  // Baileys bounds opening the socket (connectTimeoutMs) but not the login
+  // that follows it. A connection can sit at "connected to WA" forever with
+  // no close event, and nothing here would ever notice: no error, no
+  // disconnect, no retry. Give signing in a deadline of its own.
+  const LOGIN_TIMEOUT_MS = 90000;
+  let loginTimer = null;
+
+  function armLoginWatchdog() {
+    clearTimeout(loginTimer);
+    loginTimer = setTimeout(() => {
+      if (state.isReady || state.latestQr) return;
+      console.warn(
+        `[${user.id}] Still not signed in ${LOGIN_TIMEOUT_MS / 1000}s after connecting. ` +
+          'Dropping this socket and trying again.'
+      );
+      state.statusText = 'Sign-in stalled. Reconnecting...';
+      teardown()
+        .then(() => scheduleReconnect(backoffFor(state.attempts)))
+        .catch((err) => console.warn(`[${user.id}] Could not restart:`, err.message));
+    }, LOGIN_TIMEOUT_MS);
+    if (loginTimer.unref) loginTimer.unref();
+  }
+
   let refreshingAvatars = false;
   let avatarTimer = null;
   let avatarCycle = null;
@@ -678,6 +701,8 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       markOnlineOnConnect: false
     });
     state.socket = socket;
+    // From here on, signing in has a deadline.
+    armLoginWatchdog();
 
     socket.ev.on('creds.update', saveCreds);
 
@@ -735,6 +760,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.attempts = 0;
       state.qrCount += 1;
       state.pausedForScan = false;
+      // Waiting for someone to scan is not a stall.
+      clearTimeout(loginTimer);
+      loginTimer = null;
       try {
         state.latestQr = await qrcode.toDataURL(qr);
       } catch (err) {
@@ -779,6 +807,8 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       state.diskFull = false;
       state.pausedForScan = false;
       state.isReady = true;
+      clearTimeout(loginTimer);
+      loginTimer = null;
       state.statusText = 'Connected.';
       console.log(`[${user.id}] Connected. Syncing history in the background.`);
       onClaimCode(user, state);
@@ -908,6 +938,8 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   }
 
   async function teardown() {
+    clearTimeout(loginTimer);
+    loginTimer = null;
     clearTimeout(avatarTimer);
     avatarTimer = null;
     clearInterval(avatarCycle);
