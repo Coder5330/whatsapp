@@ -34,7 +34,19 @@ function getPool() {
       ssl: sslSettingFor(DATABASE_URL),
       max: 5,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000
+      // Bounds getting a connection out of the pool — not the query that
+      // follows it, which is a different failure entirely.
+      connectionTimeoutMillis: 10000,
+      // Neon closes idle connections, and the path to it can drop without
+      // either end noticing. A query issued on a socket that has quietly
+      // died has nothing to time it out: it waits for the OS to give up on
+      // the TCP connection, which is minutes, and reports neither an error
+      // nor a result. Anything awaiting it simply stops, silently — which
+      // is how a profile picture check announced itself and then never
+      // said another word.
+      query_timeout: 20000,
+      statement_timeout: 20000,
+      keepAlive: true
     });
     // A pool-level error (Neon idling a connection out, a network blip)
     // must not take the process down; pg hands the next query a new socket.

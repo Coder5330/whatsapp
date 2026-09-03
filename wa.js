@@ -627,6 +627,9 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       return;
     }
     refreshingAvatars = true;
+    // Printed before the first database call, so a pass that starts and
+    // then hangs is distinguishable from one that never started.
+    console.log(`[${user.id}] Profile pictures: checking now.`);
     let checked = 0;
     let found = 0;
     let deferred = 0;
