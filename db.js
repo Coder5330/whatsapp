@@ -129,6 +129,11 @@ ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_checked_at BIGINT;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_bytes BYTEA;
 ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_mime TEXT;
 
+-- How many times asking about this chat's picture has failed without an
+-- answer. A blip should not be permanent, so failures are retried; but a
+-- chat that never answers should not be retried forever either.
+ALTER TABLE wa_chats ADD COLUMN IF NOT EXISTS avatar_fail_count INTEGER NOT NULL DEFAULT 0;
+
 -- Migrations that must happen exactly once, rather than on every boot.
 -- Without this, "re-check everything" would mean re-checking everything at
 -- every restart, which is how an account gets rate-limited by WhatsApp.
@@ -483,10 +488,23 @@ async function setChatAvatar(inboxId, chatId, picture) {
   const { url = null, bytes = null, mimetype = null } = picture || {};
   await getPool().query(
     `UPDATE wa_chats
-        SET avatar_url = $3, avatar_bytes = $4, avatar_mime = $5, avatar_checked_at = $6
+        SET avatar_url = $3, avatar_bytes = $4, avatar_mime = $5,
+            avatar_checked_at = $6, avatar_fail_count = 0
       WHERE inbox_id = $1 AND chat_id = $2`,
     [inboxId, chatId, url, bytes, mimetype, Date.now()]
   );
+}
+
+// Records that the question could not be asked, and reports how many times
+// that has now happened in a row.
+async function noteAvatarFailure(inboxId, chatId) {
+  const { rows } = await getPool().query(
+    `UPDATE wa_chats SET avatar_fail_count = avatar_fail_count + 1
+      WHERE inbox_id = $1 AND chat_id = $2
+      RETURNING avatar_fail_count`,
+    [inboxId, chatId]
+  );
+  return rows.length ? rows[0].avatar_fail_count : 0;
 }
 
 // The bytes for one chat, read only when the browser asks for that picture.
@@ -713,6 +731,7 @@ module.exports = {
   backfillContactNames,
   listContacts,
   setChatAvatar,
+  noteAvatarFailure,
   getChatAvatar,
   chatsNeedingAvatar,
   countChatsWithAvatar,

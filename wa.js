@@ -21,7 +21,8 @@ const {
   fetchLatestBaileysVersion,
   downloadMediaMessage,
   jidNormalizedUser,
-  isLidUser
+  isLidUser,
+  getBinaryNodeChild
 } = require('baileys');
 
 const db = require('./db');
@@ -396,6 +397,10 @@ function createInboxConnection(user, sessionRoot, options = {}) {
   // One batch per connection left everything past the first 60 chats
   // waiting for the next restart. Keep going until nothing is stale.
   const AVATAR_MAX_PASSES = 20;
+  // How many times a chat may fail to answer before it is written off. A
+  // blip should not be permanent, and a permanent failure should not be
+  // retried forever.
+  const AVATAR_MAX_FAILURES = 5;
 
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -483,10 +488,32 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     return DEFINITIVE.has(Number(code));
   }
 
-  // Neither of these can have a profile picture, and asking wastes a query
-  // and produces a confusing error.
+  // None of these is a person or a group, so none has a picture to fetch.
+  // `0@s.whatsapp.net` is WhatsApp's own system account, which appears in
+  // chat lists and times out when asked.
   function canHaveAvatar(jid) {
-    return !/@(broadcast|newsletter)$/.test(String(jid)) && jid !== 'status@broadcast';
+    const value = String(jid);
+    if (/@(broadcast|newsletter)$/.test(value)) return false;
+    if (value === 'status@broadcast' || value === '0@s.whatsapp.net') return false;
+    return true;
+  }
+
+  // Baileys sends the picture query to s.whatsapp.net with the jid as a
+  // `target` attribute. WhatsApp accepts that for a person and answers
+  // internal-server-error for a group, which is where fourteen 500s came
+  // from — every one of them a @g.us. A group has to be asked directly.
+  async function groupPictureUrl(socket, jid) {
+    const result = await socket.query({
+      tag: 'iq',
+      attrs: { to: jid, type: 'get', xmlns: 'w:profile:picture' },
+      content: [{ tag: 'picture', attrs: { type: 'preview', query: 'url' } }]
+    });
+    const picture = getBinaryNodeChild(result, 'picture');
+    return picture && picture.attrs ? picture.attrs.url : null;
+  }
+
+  function pictureUrlFor(socket, jid) {
+    return isGroupJid(jid) ? groupPictureUrl(socket, jid) : socket.profilePictureUrl(jid, 'preview');
   }
 
   async function refreshAvatars() {
@@ -495,6 +522,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
     let checked = 0;
     let found = 0;
     let deferred = 0;
+    let exhausted = 0;
     const reasons = new Map();
     const examples = new Map();
     // Asked about in this run, so a row left unrecorded on purpose is not
@@ -523,7 +551,7 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           let answered = true;
 
           try {
-            url = await socket.profilePictureUrl(id, 'preview');
+            url = await pictureUrlFor(socket, id);
             // Fetch it now, while the signature on the URL is still valid.
             if (url) picture = await downloadAvatar(url);
           } catch (err) {
@@ -538,8 +566,22 @@ function createInboxConnection(user, sessionRoot, options = {}) {
           }
 
           if (!answered) {
-            // Leave the row untouched so a later sweep asks again.
-            deferred += 1;
+            // Leave the row for a later sweep — but not forever. A jid that
+            // fails this way every time would otherwise be re-asked every
+            // six hours for good, so after enough tries it is settled as
+            // having no picture and stops costing queries.
+            let fails = 0;
+            try {
+              fails = await db.noteAvatarFailure(user.id, id);
+            } catch {
+              /* the counter is an optimisation */
+            }
+            if (fails >= AVATAR_MAX_FAILURES) {
+              await db.setChatAvatar(user.id, id, null).catch(() => {});
+              exhausted += 1;
+            } else {
+              deferred += 1;
+            }
             await pause(LOOKUP_GAP_MS);
             continue;
           }
@@ -577,10 +619,11 @@ function createInboxConnection(user, sessionRoot, options = {}) {
       } catch {
         /* the tally is a nicety */
       }
-      if (checked || deferred) {
+      if (checked || deferred || exhausted) {
         console.log(
           `[${user.id}] Profile pictures: settled ${checked}, downloaded ${found}` +
             (deferred ? `, ${deferred} could not be asked and will be retried` : '') +
+            (exhausted ? `, ${exhausted} gave up after ${AVATAR_MAX_FAILURES} tries` : '') +
             (why ? `. Reasons: ${why}.` : '.') + tally
         );
       } else {
